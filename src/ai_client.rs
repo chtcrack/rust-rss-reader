@@ -1,14 +1,14 @@
 // AI 客户端模块
 
-use serde::{Deserialize, Serialize};
-use reqwest::Client;
-use std::time::Duration;
-use tokio::time::timeout;
+use dirs;
 use futures::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::fs::{File, remove_file};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use dirs;
+use std::time::Duration;
+use tokio::time::timeout;
 
 /// AI 消息角色
 enum MessageRole {
@@ -44,7 +44,7 @@ impl AIMessage {
             content: content.to_string(),
         }
     }
-    
+
     /// 创建用户消息
     pub fn user(content: &str) -> Self {
         Self {
@@ -52,7 +52,7 @@ impl AIMessage {
             content: content.to_string(),
         }
     }
-    
+
     /// 创建助手消息
     pub fn assistant(content: &str) -> Self {
         Self {
@@ -111,16 +111,16 @@ struct StreamDelta {
 pub enum AIClientError {
     #[error("HTTP 请求错误: {0}")]
     HttpRequest(#[from] reqwest::Error),
-    
+
     #[error("超时错误")]
     Timeout,
-    
+
     #[error("响应解析错误: {0}")]
     ResponseParse(#[from] serde_json::Error),
-    
+
     #[error("API 错误: {0}")]
     ApiError(String),
-    
+
     #[error("配置错误: {0}")]
     ConfigError(String),
 }
@@ -141,11 +141,11 @@ impl AIClient {
         if api_url.trim().is_empty() {
             return Err(AIClientError::ConfigError("API URL 不能为空".to_string()));
         }
-        
+
         if model_name.trim().is_empty() {
             return Err(AIClientError::ConfigError("模型名称不能为空".to_string()));
         }
-        
+
         Ok(Self {
             client: Client::new(),
             api_url: api_url.to_string(),
@@ -154,7 +154,7 @@ impl AIClient {
             timeout_duration: Duration::from_secs(30),
         })
     }
-    
+
     /// 发送聊天完成请求
     pub async fn chat_completion(
         &self,
@@ -167,7 +167,7 @@ impl AIClient {
         if self.api_key.trim().is_empty() {
             return Err(AIClientError::ConfigError("API Key 不能为空".to_string()));
         }
-        
+
         // 构建请求体
         let request = ChatCompletionRequest {
             model: self.model_name.clone(),
@@ -176,30 +176,31 @@ impl AIClient {
             max_tokens,
             stream: stream_callback.is_some(),
         };
-        
+
         // 构建请求
-        let request_builder = self.client
+        let request_builder = self
+            .client
             .post(&self.api_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&request);
-        
+
         // 发送请求并设置超时
-        let response = timeout(
-            self.timeout_duration,
-            request_builder.send()
-        ).await
-        .map_err(|_| AIClientError::Timeout)?
-        .map_err(AIClientError::HttpRequest)?;
-        
+        let response = timeout(self.timeout_duration, request_builder.send())
+            .await
+            .map_err(|_| AIClientError::Timeout)?
+            .map_err(AIClientError::HttpRequest)?;
+
         // 检查响应状态
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await
+            let error_text = response
+                .text()
+                .await
                 .unwrap_or_else(|_| format!("HTTP 错误: {}", status));
             return Err(AIClientError::ApiError(error_text));
         }
-        
+
         // 根据是否需要流式响应，选择不同的处理方式
         if let Some(callback) = stream_callback {
             // 流式响应处理
@@ -207,7 +208,7 @@ impl AIClient {
         } else {
             // 非流式响应处理
             let completion_response: ChatCompletionResponse = response.json().await?;
-            
+
             // 提取回复内容
             if let Some(choice) = completion_response.choices.first() {
                 Ok(choice.message.content.clone())
@@ -216,7 +217,7 @@ impl AIClient {
             }
         }
     }
-    
+
     /// 处理流式响应
     async fn handle_stream_response(
         &self,
@@ -225,36 +226,36 @@ impl AIClient {
     ) -> Result<String, AIClientError> {
         // 获取响应流
         let mut stream = response.bytes_stream();
-        
+
         // 用于存储完整的响应内容
         let mut full_content = String::new();
-        
+
         // 用于存储当前正在解析的行
         let mut current_line = String::new();
-        
+
         // 遍历响应流中的每个字节块
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(AIClientError::HttpRequest)?;
             let chunk_str = String::from_utf8_lossy(&chunk);
-            
+
             // 将当前块追加到当前行
             current_line.push_str(&chunk_str);
-            
+
             // 处理所有完整的行
             while let Some(newline_pos) = current_line.find("\n") {
                 // 提取完整的行
                 let line = current_line.drain(..=newline_pos).collect::<String>();
-                
+
                 // 处理 SSE 格式的行
                 if line.starts_with("data: ") {
                     // 提取数据部分
                     let data = &line[6..].trim();
-                    
+
                     // 检查是否是结束标记
                     if *data == "[DONE]" {
                         break;
                     }
-                    
+
                     // 解析 JSON 数据
                     match serde_json::from_str::<StreamChatCompletionResponse>(data) {
                         Ok(stream_response) => {
@@ -264,7 +265,7 @@ impl AIClient {
                                 if let Some(content) = choice.delta.content {
                                     // 更新完整内容
                                     full_content.push_str(&content);
-                                    
+
                                     // 调用回调函数
                                     callback(&content)?;
                                 }
@@ -278,14 +279,14 @@ impl AIClient {
                 }
             }
         }
-        
+
         Ok(full_content)
     }
-    
+
     /// 简单的提问方法，自动添加系统消息
     #[allow(unused)]
     pub async fn ask(
-        &self, 
+        &self,
         question: &str,
         stream_callback: Option<&mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>,
     ) -> Result<String, AIClientError> {
@@ -293,31 +294,37 @@ impl AIClient {
             AIMessage::system("你是一个有用的助手。请根据提供的内容，给出详细、准确的回答。"),
             AIMessage::user(question),
         ];
-        
-        self.chat_completion(&messages, Some(0.7), None, stream_callback).await
+
+        self.chat_completion(&messages, Some(0.7), None, stream_callback)
+            .await
     }
-    
+
     /// 设置超时时间
     #[allow(unused)]
     pub fn set_timeout(&mut self, duration: Duration) {
         self.timeout_duration = duration;
     }
-    
+
     /// 更新 API 配置
     #[allow(unused)]
-    pub fn update_config(&mut self, api_url: &str, api_key: &str, model_name: &str) -> Result<(), AIClientError> {
+    pub fn update_config(
+        &mut self,
+        api_url: &str,
+        api_key: &str,
+        model_name: &str,
+    ) -> Result<(), AIClientError> {
         if api_url.trim().is_empty() {
             return Err(AIClientError::ConfigError("API URL 不能为空".to_string()));
         }
-        
+
         if model_name.trim().is_empty() {
             return Err(AIClientError::ConfigError("模型名称不能为空".to_string()));
         }
-        
+
         self.api_url = api_url.to_string();
         self.api_key = api_key.to_string();
         self.model_name = model_name.to_string();
-        
+
         Ok(())
     }
 }
@@ -339,7 +346,7 @@ impl AIChatSession {
             max_history_length: 100, // 默认保留100条消息
         }
     }
-    
+
     /// 设置系统提示
     pub fn set_system_prompt(&mut self, prompt: &str) {
         // 检查是否已有系统消息
@@ -350,53 +357,57 @@ impl AIChatSession {
                 return;
             }
         }
-        
+
         // 添加新的系统消息到开头
         self.messages.insert(0, AIMessage::system(prompt));
     }
-    
+
     /// 发送消息
     pub async fn send_message(
-        &mut self, 
+        &mut self,
         content: &str,
         stream_callback: Option<&mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>,
     ) -> Result<String, AIClientError> {
         // 添加用户消息
         self.messages.push(AIMessage::user(content));
-        
+
         // 确保消息历史不超过最大长度和token限制
         self.trim_history();
-        
+
         // 估算发送的总token数
         let total_tokens = self.estimate_messages_tokens(&self.messages);
         log::info!("发送消息到AI平台，总token数: {}", total_tokens);
-        
+
         // 发送请求
-        let response = match self.client.chat_completion(&self.messages, Some(0.7), None, stream_callback).await {
+        let response = match self
+            .client
+            .chat_completion(&self.messages, Some(0.7), None, stream_callback)
+            .await
+        {
             Ok(response) => {
                 log::info!("AI平台返回成功响应");
                 response
-            },
+            }
             Err(e) => {
                 log::error!("AI平台返回错误: {:?}", e);
                 return Err(e);
             }
         };
-        
+
         // 添加助手回复
         self.messages.push(AIMessage::assistant(&response));
-        
+
         // 再次确保消息历史不超过最大长度和token限制
         self.trim_history();
-        
+
         Ok(response)
     }
-    
+
     /// 获取消息历史
     pub fn get_messages(&self) -> &[AIMessage] {
         &self.messages
     }
-    
+
     /// 清空消息历史
     pub fn clear_history(&mut self) {
         // 保留系统消息（如果有）
@@ -410,20 +421,20 @@ impl AIChatSession {
             self.messages.clear();
         }
     }
-    
+
     /// 设置最大历史长度
     #[allow(unused)]
     pub fn set_max_history_length(&mut self, length: usize) {
         self.max_history_length = length;
         self.trim_history();
     }
-    
+
     /// 添加助手回复
     pub fn add_assistant_message(&mut self, content: &str) {
         self.messages.push(AIMessage::assistant(content));
         self.trim_history();
     }
-    
+
     /// 获取聊天历史记录文件路径
     fn chat_history_path() -> PathBuf {
         let mut path = if cfg!(target_os = "windows") {
@@ -431,31 +442,31 @@ impl AIChatSession {
         } else {
             dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
         };
-        
+
         path.push("rust_rss_reader");
-        
+
         // 确保目录存在
         std::fs::create_dir_all(&path).ok();
-        
+
         path.push("ai_chat_history.json");
         path
     }
-    
+
     /// 保存聊天历史记录到JSON文件
     pub fn save_chat_history(&self) -> Result<(), std::io::Error> {
         let path = Self::chat_history_path();
-        
+
         let json = serde_json::to_string_pretty(&self.messages)?;
         let mut file = File::create(path)?;
         file.write_all(json.as_bytes())?;
-        
+
         Ok(())
     }
-    
+
     /// 从JSON文件加载聊天历史记录
     pub fn load_chat_history(&mut self) -> Result<(), std::io::Error> {
         let path = Self::chat_history_path();
-        
+
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
@@ -465,31 +476,32 @@ impl AIChatSession {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// 删除聊天历史记录文件
     pub fn delete_chat_history() -> Result<(), std::io::Error> {
         let path = Self::chat_history_path();
-        
+
         if path.exists() {
             remove_file(path)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// 估算文本的token数量（简单估算：每个token约4个字符）
     fn estimate_tokens(&self, text: &str) -> usize {
         // 简单估算：每个token约4个字符
         // 实际应用中可以使用更精确的tokenizer，如tiktoken
         (text.len() + 3) / 4
     }
-    
+
     /// 估算消息列表的总token数量
     fn estimate_messages_tokens(&self, messages: &[AIMessage]) -> usize {
-        messages.iter()
+        messages
+            .iter()
             .map(|msg| {
                 // 每个消息的token数 = 角色token数 + 内容token数 + 分隔符token数
                 // 角色通常是固定的几个单词，估算为2个token
@@ -497,12 +509,12 @@ impl AIChatSession {
             })
             .sum()
     }
-    
+
     /// 裁剪历史消息，确保总token数不超过模型限制
     fn trim_history(&mut self) {
         // 模型最大token限制（默认4096）
         const MAX_TOKENS: usize = 4096;
-        
+
         // 首先按消息数量裁剪
         if self.messages.len() > self.max_history_length {
             // 保留系统消息（如果有）
@@ -512,44 +524,46 @@ impl AIChatSession {
                     new_messages.push(first_message.clone());
                 }
             }
-            
+
             // 保留最新的消息
             let start_index = self.messages.len() - (self.max_history_length - new_messages.len());
             new_messages.extend_from_slice(&self.messages[start_index..]);
-            
+
             self.messages = new_messages;
         }
-        
+
         // 然后按token数量裁剪
         // 保留系统消息（如果有）
-        let has_system_message = self.messages.first()
+        let has_system_message = self
+            .messages
+            .first()
             .map(|msg| msg.role == MessageRole::System.to_string())
             .unwrap_or(false);
-        
+
         let mut system_message = None;
         let mut user_assistant_messages = Vec::new();
-        
+
         if has_system_message {
             system_message = self.messages.first().cloned();
             user_assistant_messages.extend_from_slice(&self.messages[1..]);
         } else {
             user_assistant_messages.extend_from_slice(&self.messages);
         }
-        
+
         // 计算系统消息的token数
         let system_tokens = system_message
             .as_ref()
             .map(|msg| self.estimate_tokens(&msg.content) + 5) // 5个token用于系统消息格式
             .unwrap_or(0);
-        
+
         // 从最新的消息开始，向前添加，直到总token数接近限制
         let mut trimmed_messages = Vec::new();
         let mut total_tokens = system_tokens;
-        
+
         // 从最新的消息开始遍历
         for msg in user_assistant_messages.iter().rev() {
             let msg_tokens = self.estimate_tokens(&msg.content) + 5; // 5个token用于消息格式
-            
+
             // 如果添加这个消息不会超过限制，就添加它
             if total_tokens + msg_tokens <= MAX_TOKENS {
                 trimmed_messages.push(msg.clone());
@@ -559,17 +573,17 @@ impl AIChatSession {
                 break;
             }
         }
-        
+
         // 反转消息顺序，因为我们是从后往前添加的
         trimmed_messages.reverse();
-        
+
         // 重新构建消息列表
         let mut new_messages = Vec::new();
         if let Some(msg) = system_message {
             new_messages.push(msg);
         }
         new_messages.extend(trimmed_messages);
-        
+
         self.messages = new_messages;
     }
 }

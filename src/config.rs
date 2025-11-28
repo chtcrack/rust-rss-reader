@@ -1,11 +1,11 @@
 // 配置管理模块
 
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 
 /// 将UTC时间转换为配置的时区时间并返回格式化的字符串
 pub fn convert_to_configured_timezone(utc_time: &DateTime<Utc>, timezone_str: &str) -> String {
@@ -41,50 +41,50 @@ pub fn convert_to_configured_timezone(utc_time: &DateTime<Utc>, timezone_str: &s
 pub struct AppConfig {
     /// 数据库路径
     pub database_path: String,
-    
+
     /// 主题设置 (light, dark, system)
     pub theme: String,
-    
+
     /// 自动刷新间隔（分钟）
     pub auto_refresh_interval: u32,
-    
+
     /// 用户代理
     pub user_agent: String,
-    
+
     /// 字体大小
     pub font_size: f32,
-    
+
     /// 窗口大小
     pub window_width: u32,
     pub window_height: u32,
-    
+
     /// 是否显示系统托盘图标
     pub show_tray_icon: bool,
-    
+
     /// 是否启用桌面通知
     pub enable_notifications: bool,
-    
+
     /// 最大通知数量
     pub max_notifications: usize,
-    
+
     /// 通知超时时间（毫秒）
     pub notification_timeout_ms: u64,
-    
+
     /// 时区设置
     pub timezone: String,
-    
+
     /// 是否显示控制台窗口（仅Windows）
     pub show_console: bool,
-    
+
     /// 搜索方式设置 (index_search, direct_search)
     pub search_mode: String,
-    
+
     /// AI API URL地址
     pub ai_api_url: String,
-    
+
     /// AI API Key
     pub ai_api_key: String,
-    
+
     /// AI 模型名称
     pub ai_model_name: String,
 }
@@ -97,16 +97,16 @@ impl AppConfig {
         } else {
             dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
         };
-        
+
         path.push("rust_rss_reader");
-        
+
         // 确保目录存在
         std::fs::create_dir_all(&path).ok();
-        
+
         path.push("config.json");
         path
     }
-    
+
     /// 创建默认配置
     pub fn default() -> Self {
         let db_path = if cfg!(target_os = "windows") {
@@ -114,7 +114,7 @@ impl AppConfig {
         } else {
             "./feeds.db".to_string()
         };
-        
+
         Self {
             database_path: db_path,
             theme: "system".to_string(),
@@ -139,11 +139,11 @@ impl AppConfig {
             ai_model_name: "Qwen/Qwen3-8B".to_string(),
         }
     }
-    
+
     /// 加载配置或使用默认值
     pub fn load_or_default() -> Self {
         let path = Self::config_path();
-        
+
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
@@ -152,19 +152,19 @@ impl AppConfig {
                 }
             }
         }
-        
+
         // 如果加载失败，返回默认配置
         Self::default()
     }
-    
+
     /// 保存配置到文件
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = Self::config_path();
-        
+
         let json = serde_json::to_string_pretty(self)?;
         let mut file = File::create(path)?;
         file.write_all(json.as_bytes())?;
-        
+
         Ok(())
     }
 }
