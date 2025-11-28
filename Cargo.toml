@@ -1,0 +1,95 @@
+[package]
+name = "rust_rss_reader"
+version = "1.0.0"
+description = "A lightweight and high-performance RSS reader for Windows 10"
+authors = ["chtcrack <chtcrack@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+# GUI框架
+egui = "0.33.2"
+eframe = { version = "0.33.2", features = ["persistence", "default_fonts", "wgpu"] }
+egui_extras = { version = "0.33.2", features = ["http", "image"] }
+image = "0.25.1" # 用于图像处理和格式转换
+web-view = "0.7.3" # 用于显示网页内容
+# HTTP客户端和异步运行时
+reqwest = { version = "0.12.24", features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1.48.0", features = ["full"] }
+regex = "1.12.2"
+
+# RSS解析和OPML支持
+rss = "2.0.12"
+opml = "1.1.6"
+
+# 数据存储
+rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+# HTML处理
+html2text = "0.16.4"
+html-escape = "0.2.13"
+flate2 = "1.0.28"  # 用于gzip解压
+encoding_rs = "0.8.35"  # 用于多种编码支持
+
+# 系统托盘和通知功能
+tray-item = "0.10.0"
+notify-rust = { version = "4.11.7", optional = true }
+
+# 配置管理
+config = { version = "0.15.19", features = ["json"] }
+
+# 错误处理
+thiserror = "1.0.49"
+anyhow = "1.0.75"
+
+# 时间处理
+chrono = { version = "0.4.42", features = ["serde"] }
+chrono-tz = "0.8.0"  # 时区支持
+
+# 命令行参数
+clap = { version = "4.4.8", features = ["derive"] }
+
+# 全局静态变量
+lazy_static = "1.5.0"
+
+# XML处理
+roxmltree = "0.21.1"
+quick-xml = "0.38.4"
+
+# 目录管理
+dirs = "5.0.1"
+
+# 随机数生成
+rand = "0.9.2"
+
+# 日志
+env_logger = "0.11.8"
+log = "0.4.28"
+
+# Windows API (用于控制控制台窗口和系统托盘)
+winapi = { version = "0.3.9", features = ["wincon", "winuser"] }
+windows-sys = "0.52.0"
+
+# 打开文件/URL
+open = "5.0.0"
+futures = "0.3.31"
+url = "2.5.7"
+rfd = "0.15.4"
+
+[features]
+default = ["tray"]
+tray = ["notify-rust"]
+
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = true
+
+# 默认二进制文件配置
+[[bin]]
+name = "rust_rss_reader"
+path = "src/main.rs"
+
+
