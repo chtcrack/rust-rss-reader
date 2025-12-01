@@ -578,7 +578,7 @@ impl RssFetcher {
         Article {
             id: 0,      // 将由数据库自动生成
             feed_id: 0, // 将在添加到数据库时设置
-            title: item.title().unwrap_or("Untitled").to_string(),
+            title: html_escape::decode_html_entities(item.title().unwrap_or("Untitled")).to_string(),
             link: item.link().unwrap_or("").to_string(),
             author: item.author().unwrap_or("Unknown").to_string(),
             pub_date,
@@ -684,25 +684,23 @@ impl RssFetcher {
         String::new()
     }
 
-    /// 清理HTML内容，移除潜在的恶意脚本
+    /// 清理HTML内容，移除无用标签，只保留纯文本和必要格式
     fn sanitize_content(&self, html: &str) -> String {
-        // 替换脚本标签
-        let mut clean_html = html
-            .replace("<script", "<noscript")
-            .replace("</script>", "</noscript>");
-
-        // 移除事件处理器和JavaScript
-        clean_html = clean_html
-            .replace(" on", " data-on")
-            .replace("javascript:", "")
-            .replace("javascript ", "");
-        // 移除VBScript
-        clean_html = clean_html.replace("vbscript:", "data-vb:");
-
-        // 处理HTML实体和特殊字符，确保正确的UTF-8编码
-        let clean_html = html_escape::decode_html_entities(&clean_html).to_string();
-
-        clean_html
+        // 首先使用html2text将HTML转换为纯文本，保留基本格式
+        let plain_text = self.html_to_plain_text(html);
+        
+        // 解码HTML实体
+        let decoded = html_escape::decode_html_entities(&plain_text);
+        
+        // 移除多余的空白字符，保留合理的换行和空格
+        let cleaned = decoded
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        cleaned
     }
 
     /// 提取文章中的图片
@@ -1136,7 +1134,7 @@ impl RssFetcher {
                 .find(|n| n.is_element() && n.tag_name().name() == "title")
                 .and_then(|n| n.text())
                 .filter(|t| !t.trim().is_empty())
-                .map(|t| t.trim().to_string())
+                .map(|t| html_escape::decode_html_entities(t.trim()).to_string())
                 .unwrap_or_else(|| "[无标题]".to_string());
 
             // 提取链接
@@ -1181,6 +1179,14 @@ impl RssFetcher {
                 .and_then(|n| n.text())
                 .map(|t| t.trim().to_string())
                 .unwrap_or_else(|| summary.clone());
+            
+            // 清理内容，移除无用标签
+            let cleaned_content = self.sanitize_content(&content_str);
+            let cleaned_summary = if !summary.is_empty() && summary != content_str {
+                self.html_to_plain_text(&summary).chars().take(200).collect::<String>()
+            } else {
+                String::new()
+            };
 
             // 提取作者
             let author = entry
@@ -1211,12 +1217,8 @@ impl RssFetcher {
                 link,
                 author,
                 pub_date,
-                content: content_str.clone(),
-                summary: if !summary.is_empty() && summary != content_str {
-                    summary
-                } else {
-                    String::new()
-                },
+                content: cleaned_content,
+                summary: cleaned_summary,
                 is_read: false,
                 is_starred: false,
                 source: feed_url.to_string(), // 使用feed_url作为source
