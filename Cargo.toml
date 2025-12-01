@@ -1,6 +1,6 @@
 [package]
 name = "rust_rss_reader"
-version = "1.0.0"
+version = "1.0.7"
 description = "A lightweight and high-performance RSS reader for Windows 10"
 authors = ["chtcrack <chtcrack@gmail.com>"]
 edition = "2024"

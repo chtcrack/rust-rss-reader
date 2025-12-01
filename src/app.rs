@@ -585,6 +585,7 @@ pub enum UiMessage {
     WebContentLoaded(String, String), // 网页内容加载完成，参数为内容和URL
     #[allow(unused)]
     SelectArticle(i64), // 选择并显示特定文章，参数为文章ID
+    TranslationCompleted(String, String), // 文章翻译完成，参数为翻译后的标题和内容
 }
 
 // 用于解析HTML内容的枚举
@@ -762,6 +763,11 @@ pub struct App {
     show_edit_group_dialog: bool,
     editing_group_name: String,
     new_group_name: String,
+
+    // 翻译相关状态
+    is_translating: bool,
+    translated_article: Option<(String, String)>, // (translated_title, translated_content)
+    show_translated_content: bool,
 }
 
 impl App {
@@ -957,6 +963,11 @@ impl App {
             show_edit_group_dialog: false,
             editing_group_name: String::new(),
             new_group_name: String::new(),
+
+            // 初始化翻译相关状态
+            is_translating: false,
+            translated_article: None,
+            show_translated_content: false,
         };
 
         // 调用异步初始化函数，传递search_manager
@@ -2433,6 +2444,10 @@ impl eframe::App for App {
                     self.is_refreshing = false;
                     // 重置初始化状态
                     self.is_initializing = false;
+                    // 重置翻译相关状态
+                    self.is_translating = false;
+                    self.translated_article = None;
+                    self.show_translated_content = false;
 
                     // 记录日志
                     // log::debug!("收到文章加载消息，数量: {}", articles.len());
@@ -2601,6 +2616,8 @@ impl eframe::App for App {
                     // 重置网页内容加载状态
                     self.is_loading_web_content = false;
                     self.show_web_content = false;
+                    // 重置翻译状态
+                    self.is_translating = false;
                     // 只在UI可见时请求重绘
                     if self.is_visible_to_user() {
                         ctx.request_repaint();
@@ -2816,6 +2833,11 @@ impl eframe::App for App {
                     // 处理选择文章消息
                     log::debug!("收到选择文章消息，文章ID: {}", article_id);
 
+                    // 重置翻译相关状态
+                    self.is_translating = false;
+                    self.translated_article = None;
+                    self.show_translated_content = false;
+
                     // 检查当前文章列表中是否存在该文章
                     let article_exists = self.articles.iter().any(|a| a.id == article_id);
 
@@ -2875,6 +2897,20 @@ impl eframe::App for App {
                     }
 
                     // 请求UI重绘，以显示选中的文章内容
+                    if self.is_visible_to_user() {
+                        ctx.request_repaint();
+                    }
+                }
+                UiMessage::TranslationCompleted(translated_title, translated_content) => {
+                    // 处理翻译完成消息
+                    log::debug!("收到翻译完成消息");
+                    // 保存翻译结果
+                    self.translated_article = Some((translated_title, translated_content));
+                    // 结束翻译状态
+                    self.is_translating = false;
+                    // 默认显示翻译后的内容
+                    self.show_translated_content = true;
+                    // 请求UI重绘
                     if self.is_visible_to_user() {
                         ctx.request_repaint();
                     }
@@ -4172,6 +4208,11 @@ impl eframe::App for App {
                                 self.selected_article_id == Some(article.id), 
                                 title
                             ).clicked() {
+                                // 重置翻译相关状态
+                                self.is_translating = false;
+                                self.translated_article = None;
+                                self.show_translated_content = false;
+                                
                                 self.selected_article_id = Some(article.id);
                                 
                                 // 自动标记为已读
@@ -4282,6 +4323,8 @@ impl eframe::App for App {
                         ));
                         ui.separator();
                         ui.label(format!("作者: {}", article.author));
+                        ui.separator();
+                        ui.label(format!("来源: {}", article.source));
                     });
 
                     ui.separator();
@@ -4298,13 +4341,22 @@ impl eframe::App for App {
                         let font_size = self.font_size;
                         let article_link = article.link.clone();
 
-                        // 显示加载状态
-                        if is_loading_web_content && current_article_url == article_link {
+                        // 显示翻译加载状态
+                        if self.is_translating {
+                            ui.centered_and_justified(|ui| {
+                                ui.add(egui::Spinner::new());
+                                ui.label("正在翻译文章...");
+                            });
+                        } 
+                        // 显示网页内容加载状态
+                        else if is_loading_web_content && current_article_url == article_link {
                             ui.centered_and_justified(|ui| {
                                 ui.add(egui::Spinner::new());
                                 ui.label("正在加载网页内容...");
                             });
-                        } else if show_web_content && current_article_url == article_link {
+                        } 
+                        // 显示网页内容
+                        else if show_web_content && current_article_url == article_link {
                             // 渲染加载的网页内容
                             Self::render_article_content_static(
                                 ui,
@@ -4312,7 +4364,23 @@ impl eframe::App for App {
                                 font_size,
                                 &article_link,
                             );
-                        } else {
+                        } 
+                        // 显示翻译后的内容
+                        else if self.show_translated_content && self.translated_article.is_some() {
+                            let (translated_title, translated_content) = self.translated_article.as_ref().unwrap();
+                            // 显示翻译后的标题
+                            ui.heading(translated_title);
+                            ui.separator();
+                            // 渲染翻译后的内容
+                            Self::render_article_content_static(
+                                ui,
+                                translated_content,
+                                font_size,
+                                &article.link,
+                            );
+                        } 
+                        // 显示原始内容
+                        else {
                             // 渲染基本的HTML内容
                             Self::render_article_content_static(
                                 ui,
@@ -4395,6 +4463,41 @@ impl eframe::App for App {
                                         let _ = ui_tx_outer.send(UiMessage::ReloadArticles);
                                     }
                                 });
+                            }
+
+                            if ui.button("翻译文章").clicked() {
+                                // 只有当AI客户端可用时才执行翻译
+                                if let Some(ai_client) = self.ai_client.clone() {
+                                    let article_title = article.title.clone();
+                                    let article_content = article.content.clone();
+                                    let ui_tx = self.ui_tx.clone();
+                                    
+                                    // 设置翻译状态
+                                    self.is_translating = true;
+                                    
+                                    tokio::spawn(async move {
+                                        match ai_client.translate_article(&article_title, &article_content).await {
+                                            Ok((translated_title, translated_content)) => {
+                                                // 翻译成功，发送结果到UI线程
+                                                let _ = ui_tx.send(UiMessage::TranslationCompleted(translated_title, translated_content));
+                                            },
+                                            Err(e) => {
+                                                // 翻译失败，发送错误信息
+                                                log::error!("翻译文章失败: {:?}", e);
+                                                let _ = ui_tx.send(UiMessage::Error(format!("翻译文章失败: {:?}", e)));
+                                                // 发送重置翻译状态的消息
+                                                let _ = ui_tx.send(UiMessage::RequestRepaint);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+
+                            // 翻译切换按钮
+                            if self.translated_article.is_some() {
+                                if ui.button(if self.show_translated_content { "显示原文" } else { "显示翻译" }).clicked() {
+                                    self.show_translated_content = !self.show_translated_content;
+                                }
                             }
                         });
 
