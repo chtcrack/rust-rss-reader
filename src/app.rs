@@ -35,6 +35,22 @@ enum AISendContentType {
     Both,
 }
 
+/// 比较旧文章和新文章，返回新增的文章列表
+pub fn get_new_articles(old_articles: &[Article], new_articles: &[Article]) -> Vec<Article> {
+    // 创建旧文章GUID集合，用于快速查找
+    let old_guids: std::collections::HashSet<String> = old_articles
+        .iter()
+        .map(|article| article.guid.clone())
+        .collect();
+    
+    // 过滤出新增的文章
+    new_articles
+        .iter()
+        .filter(|article| !old_guids.contains(&article.guid))
+        .cloned()
+        .collect()
+}
+
 /// 发送新文章通知的辅助函数
 pub fn send_new_articles_notification(
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
@@ -390,21 +406,26 @@ pub async fn perform_auto_update(
 
             // 检查是否有新文章
             if current_article_count > old_article_count {
-                let new_count = current_article_count - old_article_count;
-                log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
-
-                // 获取新文章标题（取最新的几篇）
-                let new_articles_count = new_count.min(3) as usize;
+                // 获取真正的新文章
+                let added_articles = get_new_articles(&old_articles, &new_articles);
+                let new_count = added_articles.len();
+                
+                // 初始化新文章标题向量
                 let mut new_article_titles = Vec::new();
+                
+                if new_count > 0 {
+                    log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
 
-                // 按发布时间倒序排列，取最新的文章
-                let mut sorted_articles = new_articles.clone();
-                sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
+                    // 按发布时间倒序排列，取最新的文章
+                    let mut sorted_articles = added_articles.clone();
+                    sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
-                for article in sorted_articles.iter().take(new_articles_count) {
-                    new_article_titles.push(article.title.clone());
+                    // 将所有新文章标题添加到通知列表
+                    for article in sorted_articles.iter() {
+                        new_article_titles.push(article.title.clone());
+                    }
                 }
-
+                
                 // 提前释放存储锁
                 drop(storage_lock);
 
@@ -423,29 +444,29 @@ pub async fn perform_auto_update(
                             sorted_articles.into_iter().take(new_count).collect();
 
                         // 使用tokio::spawn异步更新搜索索引，避免阻塞主流程
-                        tokio::spawn(async move {
-                            if !added_articles.is_empty() {
-                                log::info!(
-                                    "正在更新搜索索引，添加 {} 篇新文章",
-                                    added_articles.len()
-                                );
-                                let search_lock = search_mgr_clone.lock().await;
-                                // add_articles返回()而不是Result
-                                search_lock.add_articles(added_articles).await;
-                                log::info!("搜索索引更新完成");
-                            }
-                        });
+                            tokio::spawn(async move {
+                                if !added_articles.is_empty() {
+                                    log::info!(
+                                        "正在更新搜索索引，添加 {} 篇新文章",
+                                        added_articles.len()
+                                    );
+                                    let search_lock = search_mgr_clone.lock().await;
+                                    // add_articles返回()而不是Result
+                                    search_lock.add_articles(added_articles).await;
+                                    log::info!("搜索索引更新完成");
+                                }
+                            });
+                        }
                     }
-                }
 
-                // 使用封装的通知函数发送新文章通知，只在启用通知时发送
-                send_new_articles_notification(
-                    notification_manager.clone(),
-                    &feed.title,
-                    &new_article_titles,
-                    feed.enable_notification,
-                );
-            }
+                    // 使用封装的通知函数发送新文章通知，只在启用通知时发送
+                    send_new_articles_notification(
+                        notification_manager.clone(),
+                        &feed.title,
+                        &new_article_titles,
+                        feed.enable_notification,
+                    );
+                }
         }
     }
 
@@ -3232,12 +3253,12 @@ impl eframe::App for App {
                             // 直接在闭包中实现刷新所有订阅源的逻辑
                             if let Ok(feeds) = feed_manager.lock().await.get_all_feeds().await {
                                 for feed in feeds {
-                                    // 获取更新前的文章数量
-                                    let old_article_count = {
-                                        let storage_lock = storage.lock().await;
-                                        let old_articles = storage_lock.get_articles_by_feed(feed.id).await.unwrap_or_default();
-                                        old_articles.len()
-                                    };
+                                    // 获取更新前的文章
+                                                    let old_articles = {
+                                                        let storage_lock = storage.lock().await;
+                                                        storage_lock.get_articles_by_feed(feed.id).await.unwrap_or_default()
+                                                    };
+                                                    let old_article_count = old_articles.len();
                                     
                                     // 获取订阅源内容
                                     match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
@@ -3252,28 +3273,31 @@ impl eframe::App for App {
                                                 
                                                 // 检查是否有新文章
                                                 if current_article_count > old_article_count {
-                                                    let new_count = current_article_count - old_article_count;
-                                                    log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
+                                                    // 获取真正的新文章
+                                                    let added_articles = get_new_articles(&old_articles, &new_articles);
+                                                    let new_count = added_articles.len();
                                                     
-                                                    // 获取新文章标题（取最新的几篇）
-                                                    let new_articles_count = new_count.min(3) as usize;
-                                                    let mut new_article_titles = Vec::new();
+                                                    if new_count > 0 {
+                                                        log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
+                                                        
+                                                        // 按发布时间倒序排列，取最新的文章
+                                                        let mut sorted_articles = added_articles.clone();
+                                                        sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
+                                                        
+                                                        // 将所有新文章标题添加到通知列表
+                                                        let mut new_article_titles = Vec::new();
+                                                        for article in sorted_articles.iter() {
+                                                            new_article_titles.push(article.title.clone());
+                                                        }
                                                     
-                                                    // 按发布时间倒序排列，取最新的文章
-                                                    let mut sorted_articles = new_articles.clone();
-                                                    sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
-                                                    
-                                                    for article in sorted_articles.iter().take(new_articles_count) {
-                                                        new_article_titles.push(article.title.clone());
+                                                        // 发送新文章通知
+                                                        send_new_articles_notification(
+                                                            Some(notification_manager.clone()),
+                                                            &feed.title,
+                                                            &new_article_titles,
+                                                            feed.enable_notification
+                                                        );
                                                     }
-                                                    
-                                                    // 发送新文章通知
-                                                    send_new_articles_notification(
-                                                        Some(notification_manager.clone()),
-                                                        &feed.title,
-                                                        &new_article_titles,
-                                                        feed.enable_notification
-                                                    );
                                                 }
                                             }
                                         },
@@ -5194,12 +5218,12 @@ async fn refresh_single_feed_async(
             .ok_or_else(|| anyhow::anyhow!("Feed not found: {}", feed_id))?
     };
 
-    // 获取更新前的文章数量
-    let old_article_count = {
+    // 获取更新前的文章
+    let old_articles = {
         let storage_lock = storage.lock().await;
-        let old_articles = storage_lock.get_articles_by_feed(feed.id).await?;
-        old_articles.len()
+        storage_lock.get_articles_by_feed(feed.id).await?
     };
+    let old_article_count = old_articles.len();
 
     // 调用update_feed_internal函数，复用AI翻译和重复文章检查逻辑
     update_feed_internal(feed_id, &feed.url, storage.clone(), rss_fetcher.clone(), ai_client).await?;
@@ -5213,28 +5237,31 @@ async fn refresh_single_feed_async(
 
     // 检查是否有新文章
     if current_article_count > old_article_count {
-        let new_count = current_article_count - old_article_count;
-        log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
+        // 获取真正的新文章
+        let added_articles = get_new_articles(&old_articles, &new_articles);
+        let new_count = added_articles.len();
+        
+        if new_count > 0 {
+            log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
 
-        // 获取新文章标题（取最新的几篇）
-        let new_articles_count = new_count.min(3) as usize;
-        let mut new_article_titles = Vec::new();
+            // 按发布时间倒序排列，取最新的文章
+            let mut sorted_articles = added_articles.clone();
+            sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
-        // 按发布时间倒序排列，取最新的文章
-        let mut sorted_articles = new_articles.clone();
-        sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
+            // 将所有新文章标题添加到通知列表
+            let mut new_article_titles = Vec::new();
+            for article in sorted_articles.iter() {
+                new_article_titles.push(article.title.clone());
+            }
 
-        for article in sorted_articles.iter().take(new_articles_count) {
-            new_article_titles.push(article.title.clone());
+            // 发送新文章通知
+            send_new_articles_notification(
+                notification_manager,
+                &feed.title,
+                &new_article_titles,
+                feed.enable_notification,
+            );
         }
-
-        // 发送新文章通知
-        send_new_articles_notification(
-            notification_manager,
-            &feed.title,
-            &new_article_titles,
-            feed.enable_notification,
-        );
     }
 
     // 发送UI更新消息
