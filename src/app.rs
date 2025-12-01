@@ -228,11 +228,28 @@ async fn update_feed_internal(
         if feed.ai_auto_translate {
             log::info!("开始为订阅源 {} 翻译文章", feed.title);
             
+            // 先检查哪些文章已经存在于数据库中，避免重复翻译
+            let storage = _storage.lock().await;
+            let existing_articles = storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
+            let existing_guids: std::collections::HashSet<String> = existing_articles
+                .iter()
+                .map(|article| article.guid.clone())
+                .collect();
+            drop(storage); // 提前释放storage锁
+            
+            // 过滤出需要翻译的新文章
+            let new_articles: Vec<_> = articles
+                .into_iter()
+                .filter(|article| !existing_guids.contains(&article.guid))
+                .collect();
+            
+            log::info!("发现 {} 篇新文章需要翻译", new_articles.len());
+            
             // 使用独立线程执行翻译，避免阻塞主线程
             let translated_articles = tokio::spawn(async move {
                 let mut translated_articles = Vec::new();
                 
-                for article in articles {
+                for article in new_articles {
                     // 检测文章标题语言
                     let lang_result = ai_client.detect_language(&article.title).await;
                     
@@ -4043,6 +4060,7 @@ impl eframe::App for App {
                         let rss_fetcher = self.rss_fetcher.clone();
                         let notification_manager = self.notification_manager.clone();
                         let ui_tx = self.ui_tx.clone();
+                        let ai_client = self.ai_client.clone().map(Arc::new);
                         tokio::spawn(async move {
                             if feed_id == -1 {
                                 // 刷新所有订阅源的逻辑
@@ -4064,7 +4082,8 @@ impl eframe::App for App {
                                     let rss_fetcher_clone = rss_fetcher.clone();
                                     let notification_manager_clone = notification_manager.clone();
                                     let ui_tx_clone = ui_tx.clone();
-                                    if let Err(e) = refresh_single_feed_async(storage_clone, rss_fetcher_clone, feed.id, Some(notification_manager_clone), Some(ui_tx_clone)).await {
+                                    let ai_client_clone = ai_client.clone();
+                                    if let Err(e) = refresh_single_feed_async(storage_clone, rss_fetcher_clone, feed.id, Some(notification_manager_clone), Some(ui_tx_clone), ai_client_clone).await {
                                         log::error!("Failed to refresh feed {}: {}", feed.id, e);
                                     }
                                 }
@@ -4074,7 +4093,7 @@ impl eframe::App for App {
                             } else {
                                 // 刷新单个订阅源的逻辑
                                 let ui_tx_clone = ui_tx.clone();
-                                if let Err(e) = refresh_single_feed_async(storage, rss_fetcher, feed_id, Some(notification_manager), Some(ui_tx_clone)).await {
+                                if let Err(e) = refresh_single_feed_async(storage, rss_fetcher, feed_id, Some(notification_manager), Some(ui_tx_clone), ai_client).await {
                                     log::error!("Failed to refresh feed: {}", e);
                                     // 发送错误消息，重置刷新标志
                                     let _ = ui_tx.send(UiMessage::Error(format!("刷新订阅源失败: {}", e)));
@@ -5163,6 +5182,7 @@ async fn refresh_single_feed_async(
     feed_id: i64,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Option<Sender<UiMessage>>,
+    ai_client: Option<Arc<crate::ai_client::AIClient>>,
 ) -> anyhow::Result<()> {
     // 获取订阅源信息
     let feed = {
@@ -5181,19 +5201,15 @@ async fn refresh_single_feed_async(
         old_articles.len()
     };
 
-    // 从RSS源获取并解析文章
-    let articles = {
-        let rss_fetcher = rss_fetcher.lock().await;
-        rss_fetcher.fetch_feed(&feed.url).await?
+    // 调用update_feed_internal函数，复用AI翻译和重复文章检查逻辑
+    update_feed_internal(feed_id, &feed.url, storage.clone(), rss_fetcher.clone(), ai_client).await?;
+
+    // 获取更新后的文章数量和列表
+    let (current_article_count, new_articles) = {
+        let storage_lock = storage.lock().await;
+        let new_articles = storage_lock.get_articles_by_feed(feed.id).await?;
+        (new_articles.len(), new_articles)
     };
-
-    // 存储新文章
-    let mut storage = storage.lock().await;
-    storage.add_articles(feed_id, articles).await?;
-
-    // 获取更新后的文章数量
-    let new_articles = storage.get_articles_by_feed(feed.id).await?;
-    let current_article_count = new_articles.len();
 
     // 检查是否有新文章
     if current_article_count > old_article_count {
