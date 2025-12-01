@@ -250,7 +250,7 @@ impl StorageManager {
                     ai_auto_translate: row.get(11)?,
                 })
             })?
-            .collect::<SqliteResult<Vec<Feed>>>()?;
+            .collect::<rusqlite::Result<Vec<Feed>>>()?;
 
         Ok(feeds)
     }
@@ -319,7 +319,7 @@ impl StorageManager {
                     icon: row.get(2)?,
                 })
             })?
-            .collect::<SqliteResult<Vec<FeedGroup>>>()?;
+            .collect::<rusqlite::Result<Vec<FeedGroup>>>()?;
 
         Ok(groups)
     }
@@ -477,7 +477,7 @@ impl StorageManager {
                         .unwrap_or_else(|_| row.get::<_, String>(3).unwrap_or_default()),
                 })
             })?
-            .collect::<SqliteResult<Vec<Article>>>()?;
+            .collect::<rusqlite::Result<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -509,7 +509,7 @@ impl StorageManager {
                     guid: row.get(11)?,
                 })
             })?
-            .collect::<SqliteResult<Vec<Article>>>()?;
+            .collect::<rusqlite::Result<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -547,7 +547,7 @@ impl StorageManager {
                     })
                 },
             )?
-            .collect::<SqliteResult<Vec<Article>>>()?;
+            .collect::<rusqlite::Result<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -866,7 +866,7 @@ impl StorageManager {
                     guid: row.get(11)?,
                 })
             })?
-            .collect::<SqliteResult<Vec<Article>>>()?;
+            .collect::<rusqlite::Result<Vec<Article>>>()?;
 
         Ok(articles)
     }

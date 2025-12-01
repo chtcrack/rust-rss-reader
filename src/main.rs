@@ -31,6 +31,7 @@ fn set_console_visible(_visible: bool) {
 // 导入自定义模块
 mod ai_client;
 mod app;
+mod article_processor;
 mod config;
 mod feed_manager;
 mod models;
