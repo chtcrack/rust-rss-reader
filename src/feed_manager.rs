@@ -55,6 +55,7 @@ impl FeedManager {
             favicon: None,
             auto_update: true,         // 默认开启自动更新
             enable_notification: true, // 默认启用通知
+            ai_auto_translate: false,   // 默认关闭AI自动翻译
         };
 
         // 尝试从URL获取网站链接作为link

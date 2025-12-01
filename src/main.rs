@@ -260,6 +260,7 @@ fn test_auto_update() -> Result<(), eframe::Error> {
             None,
             ui_tx.clone(),
             search_manager.clone(),
+            None, // AI客户端，测试中不使用
         )
         .await
         {
@@ -276,7 +277,7 @@ fn test_auto_update() -> Result<(), eframe::Error> {
         let handle = tokio::spawn(async move {
             println!("启动自动更新任务...");
             // 这里不需要重新创建SearchManager，使用已有的
-            perform_auto_update(storage_clone, rss_fetcher_clone, None, ui_tx_clone, None).await
+            perform_auto_update(storage_clone, rss_fetcher_clone, None, ui_tx_clone, None, None).await
         });
 
         // 等待一小段时间

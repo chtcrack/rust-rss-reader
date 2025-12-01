@@ -86,7 +86,8 @@ impl StorageManager {
                 link TEXT,
                 favicon TEXT,
                 auto_update INTEGER DEFAULT 1,
-                enable_notification INTEGER DEFAULT 1
+                enable_notification INTEGER DEFAULT 1,
+                ai_auto_translate INTEGER DEFAULT 0
             )"#,
             [],
         )?;
@@ -110,6 +111,15 @@ impl StorageManager {
         if !has_enable_notification {
             conn.execute(
                 "ALTER TABLE feeds ADD COLUMN enable_notification INTEGER DEFAULT 1",
+                [],
+            )?;
+        }
+
+        // 检查并添加ai_auto_translate字段（如果不存在）
+        let has_ai_auto_translate = table_info.iter().any(|col| col == "ai_auto_translate");
+        if !has_ai_auto_translate {
+            conn.execute(
+                "ALTER TABLE feeds ADD COLUMN ai_auto_translate INTEGER DEFAULT 0",
                 [],
             )?;
         }
@@ -190,8 +200,8 @@ impl StorageManager {
 
         // 添加新订阅源，包含last_updated字段
         let _result = conn.execute(
-            "INSERT INTO feeds (title, url, group_name, description, language, link, favicon, last_updated, auto_update, enable_notification) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO feeds (title, url, group_name, description, language, link, favicon, last_updated, auto_update, enable_notification, ai_auto_translate) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 feed.title,
                 feed.url,
@@ -202,7 +212,8 @@ impl StorageManager {
                 feed.favicon,
                 feed.last_updated.unwrap_or_else(chrono::Utc::now), // 使用当前时间作为默认值
                 feed.auto_update as i8,
-                feed.enable_notification as i8
+                feed.enable_notification as i8,
+                feed.ai_auto_translate as i8
             ],
         )?;
 
@@ -218,7 +229,7 @@ impl StorageManager {
         let conn = self.connection.lock().await;
 
         let mut stmt = conn.prepare(
-            "SELECT id, title, url, group_name, last_updated, description, language, link, favicon, auto_update, enable_notification 
+            "SELECT id, title, url, group_name, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate 
              FROM feeds ORDER BY group_name, title"
         )?;
 
@@ -236,6 +247,7 @@ impl StorageManager {
                     favicon: row.get(8)?,
                     auto_update: row.get(9)?,
                     enable_notification: row.get(10)?,
+                    ai_auto_translate: row.get(11)?,
                 })
             })?
             .collect::<SqliteResult<Vec<Feed>>>()?;
@@ -250,7 +262,7 @@ impl StorageManager {
 
         conn.execute(
             "UPDATE feeds SET title = ?, url = ?, group_name = ?, description = ?, 
-             language = ?, link = ?, favicon = ?, auto_update = ?, enable_notification = ? WHERE id = ?",
+             language = ?, link = ?, favicon = ?, auto_update = ?, enable_notification = ?, ai_auto_translate = ? WHERE id = ?",
             params![
                 feed.title,
                 feed.url,
@@ -261,6 +273,7 @@ impl StorageManager {
                 feed.favicon,
                 feed.auto_update as i8,
                 feed.enable_notification as i8,
+                feed.ai_auto_translate as i8,
                 feed.id
             ],
         )?;

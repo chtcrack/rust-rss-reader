@@ -210,11 +210,83 @@ async fn update_feed_internal(
     feed_url: &str,
     _storage: Arc<Mutex<StorageManager>>,
     rss_fetcher: Arc<Mutex<RssFetcher>>,
+    ai_client: Option<Arc<crate::ai_client::AIClient>>,
 ) -> anyhow::Result<()> {
     // 获取RSS内容
     let fetcher = rss_fetcher.lock().await;
-    let articles = fetcher.fetch_feed(feed_url).await?;
+    let mut articles = fetcher.fetch_feed(feed_url).await?;
     drop(fetcher); // 提前释放fetcher锁
+
+    // 获取订阅源信息，检查是否启用AI自动翻译
+    let storage_lock = _storage.lock().await;
+    let feeds = storage_lock.get_all_feeds().await?;
+    let feed = feeds.into_iter().find(|f| f.id == feed_id);
+    drop(storage_lock); // 提前释放storage锁
+
+    // 如果启用了AI自动翻译，并且有AI客户端，则进行翻译
+    if let (Some(feed), Some(ai_client)) = (feed, ai_client) {
+        if feed.ai_auto_translate {
+            log::info!("开始为订阅源 {} 翻译文章", feed.title);
+            
+            // 使用独立线程执行翻译，避免阻塞主线程
+            let translated_articles = tokio::spawn(async move {
+                let mut translated_articles = Vec::new();
+                
+                for article in articles {
+                    // 检测文章标题语言
+                    let lang_result = ai_client.detect_language(&article.title).await;
+                    
+                    match lang_result {
+                        Ok(lang) => {
+                            log::info!("文章标题语言检测结果: {}", lang);
+                            
+                            // 如果不是中文，则进行翻译
+                            if lang != "zh" {
+                                log::info!("开始翻译文章: {}", article.title);
+                                
+                                // 翻译文章标题和内容
+                                let translate_result = ai_client.translate_article(
+                                    &article.title,
+                                    &article.content,
+                                ).await;
+                                
+                                match translate_result {
+                                    Ok((translated_title, translated_content)) => {
+                                        log::info!("文章翻译成功: {}", article.title);
+                                        
+                                        // 创建翻译后的文章
+                                        let mut translated_article = article.clone();
+                                        translated_article.title = translated_title;
+                                        translated_article.content = translated_content;
+                                        
+                                        translated_articles.push(translated_article);
+                                    },
+                                    Err(e) => {
+                                        log::error!("文章翻译失败: {}, 错误: {:?}", article.title, e);
+                                        // 翻译失败，使用原文
+                                        translated_articles.push(article);
+                                    }
+                                }
+                            } else {
+                                // 中文文章，直接使用原文
+                                translated_articles.push(article);
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("语言检测失败: {}, 错误: {:?}", article.title, e);
+                            // 语言检测失败，使用原文
+                            translated_articles.push(article);
+                        }
+                    }
+                }
+                
+                translated_articles
+            }).await?;
+            
+            // 使用翻译后的文章
+            articles = translated_articles;
+        }
+    }
 
     // 更新订阅源信息和添加文章
     let mut storage_lock = _storage.lock().await;
@@ -248,6 +320,7 @@ pub async fn perform_auto_update(
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Sender<UiMessage>,
     search_manager: Option<Arc<Mutex<SearchManager>>>,
+    ai_client: Option<Arc<crate::ai_client::AIClient>>,
 ) -> anyhow::Result<()> {
     log::info!("开始执行自动更新");
 
@@ -281,7 +354,7 @@ pub async fn perform_auto_update(
 
         // 更新订阅源
         if let Err(e) =
-            update_feed_internal(feed.id, &feed.url, _storage.clone(), rss_fetcher.clone()).await
+            update_feed_internal(feed.id, &feed.url, _storage.clone(), rss_fetcher.clone(), ai_client.clone()).await
         {
             log::error!(
                 "更新订阅源失败 (ID: {}, URL: {}): {:?}",
@@ -384,6 +457,7 @@ async fn add_feed_async(
     feed_title: String,
     feed_group: String,
     auto_update: bool, // 添加自动更新参数
+    ai_auto_translate: bool, // 添加AI自动翻译参数
     _storage: Arc<Mutex<StorageManager>>,
     rss_fetcher: Arc<Mutex<RssFetcher>>,
     _feed_manager: Arc<Mutex<FeedManager>>,
@@ -399,6 +473,7 @@ async fn add_feed_async(
     // 获取RSS内容
     let fetcher = rss_fetcher.lock().await;
     let articles = fetcher.fetch_feed(url.as_str()).await?;
+    drop(fetcher); // 提前释放fetcher锁
 
     // 创建新的订阅源
     let new_feed = Feed {
@@ -413,17 +488,95 @@ async fn add_feed_async(
         favicon: None,
         auto_update,               // 使用传入的自动更新设置
         enable_notification: true, // 默认启用通知
+        ai_auto_translate,         // 使用传入的AI自动翻译设置
     };
 
     // 保存订阅源到数据库
     let mut storage = _storage.lock().await;
-    let feed_id = storage.add_feed(new_feed).await?;
+    let feed_id = storage.add_feed(new_feed.clone()).await?;
 
     // 保存文章
     if !articles.is_empty() {
-        let _article_count = articles.len();
+        let mut articles_to_save = articles;
+        
+        // 如果启用了AI自动翻译，对文章进行翻译
+        if new_feed.ai_auto_translate {
+            log::info!("开始为新添加的订阅源 {} 翻译文章", new_feed.title);
+            
+            // 获取AI客户端
+            let ai_client = AIClient::new(
+                &crate::config::AppConfig::load_or_default().ai_api_url,
+                &crate::config::AppConfig::load_or_default().ai_api_key,
+                &crate::config::AppConfig::load_or_default().ai_model_name,
+            );
+            
+            if let Ok(ai_client) = ai_client {
+                // 使用独立线程执行翻译，避免阻塞主线程
+                let articles_clone = articles_to_save.clone();
+                let translated_articles = tokio::spawn(async move {
+                    let mut translated_articles = Vec::new();
+                    
+                    for article in articles_clone {
+                        // 检测文章标题语言
+                        let lang_result = ai_client.detect_language(&article.title).await;
+                        
+                        match lang_result {
+                            Ok(lang) => {
+                                log::info!("文章标题语言检测结果: {}", lang);
+                                
+                                // 如果不是中文，则进行翻译
+                                if lang != "zh" {
+                                    log::info!("开始翻译文章: {}", article.title);
+                                    
+                                    // 翻译文章标题和内容
+                                    let translate_result = ai_client.translate_article(
+                                        &article.title,
+                                        &article.content,
+                                    ).await;
+                                    
+                                    match translate_result {
+                                        Ok((translated_title, translated_content)) => {
+                                            log::info!("文章翻译成功: {}", article.title);
+                                            
+                                            // 创建翻译后的文章
+                                            let mut translated_article = article.clone();
+                                            translated_article.title = translated_title;
+                                            translated_article.content = translated_content;
+                                            
+                                            translated_articles.push(translated_article);
+                                        },
+                                        Err(e) => {
+                                            log::error!("文章翻译失败: {}, 错误: {:?}", article.title, e);
+                                            // 翻译失败，使用原文
+                                            translated_articles.push(article);
+                                        }
+                                    }
+                                } else {
+                                    // 中文文章，直接使用原文
+                                    translated_articles.push(article);
+                                }
+                            },
+                            Err(e) => {
+                                log::error!("语言检测失败: {}, 错误: {:?}", article.title, e);
+                                // 语言检测失败，使用原文
+                                translated_articles.push(article);
+                            }
+                        }
+                    }
+                    
+                    translated_articles
+                }).await;
+                
+                // 使用翻译后的文章
+                if let Ok(translated_articles) = translated_articles {
+                    articles_to_save = translated_articles;
+                }
+            }
+        }
+        
+        let _article_count = articles_to_save.len();
         // 尝试批量保存文章
-        if let Ok(new_articles_count) = storage.add_articles(feed_id, articles).await {
+        if let Ok(new_articles_count) = storage.add_articles(feed_id, articles_to_save).await {
             log::info!("成功保存 {} 篇文章", new_articles_count);
         }
     }
@@ -630,6 +783,7 @@ pub struct App {
     new_feed_title: String,
     new_feed_group: String,
     new_feed_auto_update: bool,
+    new_feed_ai_auto_translate: bool,
     show_add_feed_dialog: bool,
 
     // 编辑订阅源状态
@@ -639,6 +793,7 @@ pub struct App {
     edit_feed_group: String,
     edit_feed_auto_update: bool,
     edit_feed_enable_notification: bool,
+    edit_feed_ai_auto_translate: bool,
     show_edit_feed_dialog: bool,
 
     // 刷新状态
@@ -834,6 +989,7 @@ impl App {
             new_feed_title: String::new(),
             new_feed_group: String::new(),
             new_feed_auto_update: true, // 默认开启自动更新
+            new_feed_ai_auto_translate: false, // 默认关闭AI自动翻译
             show_add_feed_dialog: false,
             edit_feed_id: None,
             edit_feed_url: String::new(),
@@ -841,6 +997,7 @@ impl App {
             edit_feed_group: String::new(),
             edit_feed_auto_update: true,         // 默认开启自动更新
             edit_feed_enable_notification: true, // 默认开启通知
+            edit_feed_ai_auto_translate: false,  // 默认关闭AI自动翻译
             show_edit_feed_dialog: false,
             is_refreshing: false,
             is_initializing: false,
@@ -1081,6 +1238,7 @@ impl App {
         let ui_tx_clone = self.ui_tx.clone();
         let notification_manager_clone = self.notification_manager.clone();
         let search_manager_clone = self.search_manager.clone();
+        let ai_client = self.ai_client.clone();
         let interval = self.auto_update_interval;
 
         // 启动后台任务
@@ -1092,13 +1250,14 @@ impl App {
                 log::debug!("自动更新任务等待: {} 分钟", interval);
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval * 60)).await;
 
-                // 执行更新
+                        // 执行更新
                 if let Err(e) = perform_auto_update(
                     storage_clone.clone(),
                     rss_fetcher_clone.clone(),
                     Some(notification_manager_clone.clone()),
                     ui_tx_clone.clone(),
                     Some(search_manager_clone.clone()),
+                    ai_client.clone().map(Arc::new),
                 )
                 .await
                 {
@@ -1180,6 +1339,7 @@ impl App {
                 log::debug!("创建示例订阅源");
                 let example_feed = Feed {
                     auto_update: true,
+                    ai_auto_translate: false,
                     id: 0, // 会在添加时自动生成
                     title: "欢迎使用 Rust RSS 阅读器".to_string(),
                     url: "example://welcome".to_string(),
@@ -3506,6 +3666,7 @@ impl eframe::App for App {
                                 self.edit_feed_group = feed.group.clone();
                                 self.edit_feed_auto_update = feed.auto_update;
                                 self.edit_feed_enable_notification = feed.enable_notification;
+                                self.edit_feed_ai_auto_translate = feed.ai_auto_translate;
                                 self.show_edit_feed_dialog = true;
                                 ui.close();
                             }
@@ -3625,6 +3786,8 @@ impl eframe::App for App {
                                         self.edit_feed_url = feed.url.clone();
                                         self.edit_feed_group = feed.group.clone();
                                         self.edit_feed_auto_update = feed.auto_update;
+                                        self.edit_feed_enable_notification = feed.enable_notification;
+                                        self.edit_feed_ai_auto_translate = feed.ai_auto_translate;
                                         self.show_edit_feed_dialog = true;
                                         // 使用close_menu的替代方法
                                         ui.close();
@@ -4370,6 +4533,7 @@ impl eframe::App for App {
                     ui.text_edit_singleline(&mut self.new_feed_group);
 
                     ui.checkbox(&mut self.new_feed_auto_update, "自动更新");
+                    ui.checkbox(&mut self.new_feed_ai_auto_translate, "AI自动翻译");
 
                     ui.horizontal(|ui| {
                         if ui.button("添加").clicked() {
@@ -4377,6 +4541,7 @@ impl eframe::App for App {
                             let feed_title = self.new_feed_title.clone();
                             let feed_group = self.new_feed_group.clone();
                             let auto_update = self.new_feed_auto_update;
+                            let ai_auto_translate = self.new_feed_ai_auto_translate;
                             let storage = self.storage.clone();
                             let rss_fetcher = self.rss_fetcher.clone();
                             let feed_manager = self.feed_manager.clone();
@@ -4387,6 +4552,7 @@ impl eframe::App for App {
                                     feed_title,
                                     feed_group,
                                     auto_update,
+                                    ai_auto_translate,
                                     storage,
                                     rss_fetcher,
                                     feed_manager,
@@ -4408,6 +4574,7 @@ impl eframe::App for App {
                             self.new_feed_title.clear();
                             self.new_feed_group.clear();
                             self.new_feed_auto_update = true; // 重置为默认值
+                            self.new_feed_ai_auto_translate = false; // 重置为默认值
                             self.show_add_feed_dialog = false;
                         }
                     });
@@ -4432,6 +4599,8 @@ impl eframe::App for App {
 
                     ui.checkbox(&mut self.edit_feed_enable_notification, "启用通知");
 
+                    ui.checkbox(&mut self.edit_feed_ai_auto_translate, "AI自动翻译");
+
                     ui.horizontal(|ui| {
                         if ui.button("保存").clicked() {
                             if let Some(feed_id) = self.edit_feed_id {
@@ -4443,6 +4612,7 @@ impl eframe::App for App {
 
                                 let feed_auto_update = self.edit_feed_auto_update;
                                 let feed_enable_notification = self.edit_feed_enable_notification;
+                                let feed_ai_auto_translate = self.edit_feed_ai_auto_translate;
                                 // 异步更新订阅源
                                 tokio::spawn(async move {
                                     update_feed_async(
@@ -4454,6 +4624,7 @@ impl eframe::App for App {
                                         feed_group,
                                         feed_auto_update,
                                         feed_enable_notification,
+                                        feed_ai_auto_translate,
                                     )
                                     .await;
                                 });
@@ -5202,6 +5373,7 @@ async fn update_feed_async(
     group: String,
     auto_update: bool,         // 自动更新设置
     enable_notification: bool, // 通知设置
+    ai_auto_translate: bool,   // AI自动翻译设置
 ) {
     // 验证输入
     if title.is_empty() || url.is_empty() {
@@ -5225,6 +5397,7 @@ async fn update_feed_async(
         feed.group = group;
         feed.auto_update = auto_update; // 更新自动更新设置
         feed.enable_notification = enable_notification; // 更新通知设置
+        feed.ai_auto_translate = ai_auto_translate; // 更新AI自动翻译设置
 
         // 保存到数据库
         if let Err(e) = storage.lock().await.update_feed(feed).await {

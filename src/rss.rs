@@ -268,7 +268,8 @@ impl RssFetcher {
                 "Accept",
                 "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
             )
-            .header("Accept-Encoding", "identity") // 明确要求不压缩，避免gzip解压问题
+            .header("Referer", url) // 策略1：指向自己（简单有效）
+            //.header("Accept-Encoding", "identity") // 明确要求不压缩，避免gzip解压问题
             .header("Cache-Control", "no-cache")
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8") // 添加语言支持
             .timeout(std::time::Duration::from_secs(15)) // 增加超时时间

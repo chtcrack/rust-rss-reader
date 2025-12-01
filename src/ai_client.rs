@@ -299,6 +299,53 @@ impl AIClient {
             .await
     }
 
+    /// 检测文本语言
+    pub async fn detect_language(&self, text: &str) -> Result<String, AIClientError> {
+        let messages = vec![
+            AIMessage::system("你是一个语言检测专家。请仅返回文本的语言代码，如中文返回'zh'，英文返回'en'，日语返回'ja'，韩语返回'ko'，法语返回'fr'，德语返回'de'，西班牙语返回'es'，俄语返回'ru'，其他语言返回对应的ISO 639-1语言代码。不要返回任何解释或其他内容。"),
+            AIMessage::user(text),
+        ];
+
+        let result = self.chat_completion(&messages, Some(0.0), Some(10), None).await?;
+        Ok(result.trim().to_lowercase())
+    }
+
+    /// 翻译文本为中文 暂时未使用,可以为以后的功能进行调用
+    #[allow(unused)]
+    pub async fn translate_to_chinese(&self, text: &str) -> Result<String, AIClientError> {
+        let messages = vec![
+            AIMessage::system("你是一个专业的翻译官。请将以下文本翻译成中文，保持原意准确，语言流畅自然。不要添加任何解释或其他内容，仅返回翻译结果。"),
+            AIMessage::user(text),
+        ];
+
+        self.chat_completion(&messages, Some(0.3), None, None).await
+    }
+
+    /// 翻译文章标题和内容为中文
+    pub async fn translate_article(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<(String, String), AIClientError> {
+        let title_prompt = format!("请将以下文章标题翻译成中文，保持原意准确，语言流畅自然：\n\n{}", title);
+        let content_prompt = format!("请将以下文章内容翻译成中文，保持原意准确，语言流畅自然：\n\n{}", content);
+
+        let title_messages = vec![
+            AIMessage::system("你是一个专业的翻译官。请将文本翻译成中文，保持原意准确，语言流畅自然。不要添加任何解释或其他内容，仅返回翻译结果。"),
+            AIMessage::user(&title_prompt),
+        ];
+
+        let content_messages = vec![
+            AIMessage::system("你是一个专业的翻译官。请将文本翻译成中文，保持原意准确，语言流畅自然。不要添加任何解释或其他内容，仅返回翻译结果。"),
+            AIMessage::user(&content_prompt),
+        ];
+
+        let translated_title = self.chat_completion(&title_messages, Some(0.3), None, None).await?;
+        let translated_content = self.chat_completion(&content_messages, Some(0.3), None, None).await?;
+
+        Ok((translated_title, translated_content))
+    }
+
     /// 设置超时时间
     #[allow(unused)]
     pub fn set_timeout(&mut self, duration: Duration) {

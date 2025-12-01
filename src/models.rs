@@ -38,6 +38,9 @@ pub struct Feed {
 
     /// 是否启用通知
     pub enable_notification: bool,
+
+    /// 是否启用AI自动翻译
+    pub ai_auto_translate: bool,
 }
 
 /// 文章数据模型
