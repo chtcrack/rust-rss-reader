@@ -53,8 +53,16 @@ impl StorageManager {
             eprintln!("警告: 无法执行VACUUM: {}", e);
         }
         // 3. 其他优化设置
+        // 使用WAL模式，提高并发性能和崩溃恢复能力
         let _ = conn.execute("PRAGMA journal_mode = WAL;", []);
+        // 设置synchronous=NORMAL，平衡性能和安全性
         let _ = conn.execute("PRAGMA synchronous = NORMAL;", []);
+        // 设置WAL自动检查点阈值为1000页，控制WAL文件大小
+        let _ = conn.execute("PRAGMA wal_autocheckpoint = 1000;", []);
+        // 启用WAL校验和，提高数据完整性
+        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", []);
+        // 启用数据完整性检查
+        let _ = conn.execute("PRAGMA integrity_check;", []);
 
         Self {
             connection: Arc::new(Mutex::new(conn)),
@@ -346,6 +354,32 @@ impl StorageManager {
         conn.execute("DELETE FROM feed_groups WHERE id = ?", params![group_id])?;
 
         Ok(())
+    }
+
+    /// 添加分组
+    #[allow(unused)]
+    pub async fn add_group(&mut self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
+        let conn = self.connection.lock().await;
+
+        // 验证分组名称不为空
+        if group_name.trim().is_empty() {
+            return Err(anyhow::anyhow!("分组名称不能为空"));
+        }
+
+        // 插入分组，使用INSERT OR IGNORE避免重复
+        conn.execute(
+            "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
+            params![group_name.trim(), icon],
+        )?;
+
+        // 获取插入的ID或已存在的ID
+        let group_id = conn.query_row(
+            "SELECT id FROM feed_groups WHERE name = ?",
+            params![group_name.trim()],
+            |row| row.get(0),
+        )?;
+
+        Ok(group_id)
     }
 
     /// 更新分组名称

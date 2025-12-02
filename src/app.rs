@@ -498,18 +498,86 @@ async fn import_opml_async(
     file_path: &str,
 ) -> anyhow::Result<usize> {
     // 读取OPML文件内容
-    let _content = tokio::fs::read_to_string(file_path).await?;
+    let content = tokio::fs::read_to_string(file_path).await?;
 
-    // 这里应该有OPML解析的逻辑
-    // 为了简化，我们暂时返回一个示例值
-    println!("正在处理OPML文件: {}", file_path);
+    // 使用opml库解析OPML文件
+    let opml = opml::OPML::from_str(&content)?;
 
-    // 模拟导入了一些订阅源
-    // 实际应用中应该解析OPML并导入订阅源
-    let feed_count = 5;
+    // 遍历解析出的大纲节点，使用迭代方式处理
+    let mut feed_count = 0;
+    let mut stack = Vec::new();
+    
+    // 初始化栈，包含根节点和当前分组
+    for outline in &opml.body.outlines {
+        stack.push((outline, String::new()));
+    }
+    
+    while let Some((outline, current_group)) = stack.pop() {
+        // 检查是否是RSS订阅源
+        if outline.outlines.is_empty() && outline.r#type.as_deref() == Some("rss") {
+            // 提取订阅源信息
+            let title = if let Some(title) = outline.title.as_deref() {
+                title.to_string()
+            } else if !outline.text.is_empty() {
+                outline.text.clone()
+            } else {
+                "未知标题".to_string()
+            };
+            let url = match outline.xml_url.as_deref() {
+                Some(url) => url.trim().to_string(),
+                None => continue, // 跳过没有XML URL的节点
+            };
 
-    // 更新订阅源管理器
-    // FeedManager暂时没有load_feeds方法，可能需要从storage加载
+            // 检查URL是否已存在于系统中
+            let feed_manager = _feed_manager.lock().await;
+            if feed_manager.feed_exists(&url).await? {
+                // URL已存在，跳过当前条目
+                continue;
+            }
+
+            // 创建Feed对象
+            let feed = Feed {
+                id: 0, // 将由数据库自动生成
+                title: title.trim().to_string(),
+                url: url.clone(),
+                group: current_group.trim().to_string(),
+                last_updated: None,
+                description: String::new(),
+                language: String::new(),
+                link: outline.html_url.as_deref().unwrap_or("").to_string(),
+                favicon: None,
+                auto_update: true,         // 默认开启自动更新
+                enable_notification: true, // 默认启用通知
+                ai_auto_translate: false,   // 默认关闭AI自动翻译
+            };
+
+            // 保存到数据库
+            let mut storage = _storage.lock().await;
+            storage.add_feed(feed).await?;
+            feed_count += 1;
+        } else {
+            // 这是一个分组节点
+            let group_name = if let Some(title) = outline.title.as_deref() {
+                title.to_string()
+            } else if !outline.text.is_empty() {
+                outline.text.clone()
+            } else {
+                "未分组".to_string()
+            };
+            
+            // 确保分组信息被添加到数据库中
+            if !group_name.is_empty() {
+                let mut storage = _storage.lock().await;
+                // 添加分组，使用INSERT OR IGNORE避免重复
+                storage.add_group(&group_name, None).await?;
+            }
+            
+            // 将子节点压入栈中，注意顺序，确保按原顺序处理
+            for child in outline.outlines.iter().rev() {
+                stack.push((child, group_name.clone()));
+            }
+        }
+    }
 
     Ok(feed_count)
 }
@@ -523,19 +591,46 @@ async fn export_opml_async(
     let storage = _storage.lock().await;
     let feeds = storage.get_all_feeds().await?;
 
-    // 生成简单的OPML内容
+    // 生成符合OPML规范的XML内容
     let mut opml_content = String::new();
     opml_content.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?><opml version=\"1.0\">");
-    opml_content.push_str("<head><title>RSS订阅源</title></head>");
+    opml_content.push_str("<head><title>RSS订阅源</title>");
+    opml_content.push_str(&format!("<dateCreated>{}</dateCreated></head>", chrono::Utc::now().to_rfc2822()));
     opml_content.push_str("<body>");
 
-    for feed in feeds {
-        opml_content.push_str(&format!(
-            "<outline type=\"rss\" text=\"{}\" title=\"{}\" xmlUrl=\"{}\" />",
-            escape_xml(&feed.title),
-            escape_xml(&feed.title),
-            escape_xml(&feed.url)
-        ));
+    // 按分组组织订阅源
+    let mut groups: std::collections::BTreeMap<String, Vec<&Feed>> = std::collections::BTreeMap::new();
+    for feed in &feeds {
+        let group_name = feed.group.clone();
+        groups.entry(group_name).or_insert_with(Vec::new).push(feed);
+    }
+
+    // 输出分组和订阅源
+    for (group_name, feeds_in_group) in groups {
+        if !group_name.is_empty() {
+            opml_content.push_str(&format!(
+                "<outline text=\"{}\" title=\"{}\">
+",
+                escape_xml(&group_name),
+                escape_xml(&group_name)
+            ));
+        }
+
+        for feed in feeds_in_group {
+            opml_content.push_str(&format!(
+                "<outline type=\"rss\" text=\"{}\" title=\"{}\" xmlUrl=\"{}\" htmlUrl=\"{}\" />
+",
+                escape_xml(&feed.title),
+                escape_xml(&feed.title),
+                escape_xml(&feed.url),
+                escape_xml(&feed.link)
+            ));
+        }
+
+        if !group_name.is_empty() {
+            opml_content.push_str("</outline>
+");
+        }
     }
 
     opml_content.push_str("</body></opml>");
