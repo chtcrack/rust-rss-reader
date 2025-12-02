@@ -362,6 +362,7 @@ async fn add_feed_async(
         title: feed_title.clone(), // 使用clone避免所有权转移
         url: feed_url,
         group: feed_group,
+        group_id: None,
         description: String::new(), // 暂时为空，后续可能需要从其他地方获取
         last_updated: Some(chrono::Utc::now()),
         language: String::new(), // 暂时为空
@@ -529,8 +530,12 @@ async fn import_opml_async(
             };
 
             // 检查URL是否已存在于系统中
-            let feed_manager = _feed_manager.lock().await;
-            if feed_manager.feed_exists(&url).await? {
+            let url_exists = {
+                let storage_lock = _storage.lock().await;
+                let all_feeds = storage_lock.get_all_feeds().await?;
+                all_feeds.iter().any(|f| f.url == url)
+            };
+            if url_exists {
                 // URL已存在，跳过当前条目
                 continue;
             }
@@ -541,6 +546,7 @@ async fn import_opml_async(
                 title: title.trim().to_string(),
                 url: url.clone(),
                 group: current_group.trim().to_string(),
+                group_id: None,
                 last_updated: None,
                 description: String::new(),
                 language: String::new(),
@@ -856,6 +862,7 @@ pub struct App {
 
     // 编辑分组状态
     show_edit_group_dialog: bool,
+
     editing_group_name: String,
     new_group_name: String,
 
@@ -1056,6 +1063,7 @@ impl App {
 
             // 初始化编辑分组状态
             show_edit_group_dialog: false,
+
             editing_group_name: String::new(),
             new_group_name: String::new(),
 
@@ -1293,6 +1301,22 @@ impl App {
             // 继续原有的初始化逻辑
             log::debug!("获取存储管理器的锁（加载数据）");
             let mut storage_lock = storage.lock().await;
+            
+            // 执行数据迁移，将group_name映射为group_id
+            log::debug!("执行数据迁移，将group_name映射为group_id");
+            if let Err(e) = storage_lock.migrate_feed_group_ids().await {
+                log::debug!("数据迁移失败: {}", e);
+            } else {
+                log::info!("数据迁移成功完成");
+                
+                // 清理feeds表中的group_name字段
+                log::debug!("清理feeds表中的group_name字段");
+                if let Err(e) = storage_lock.cleanup_group_name_field().await {
+                    log::error!("清理group_name字段失败: {}", e);
+                } else {
+                    log::info!("清理group_name字段成功");
+                }
+            }
             log::debug!("成功获取存储管理器的锁");
 
             // 加载所有订阅源
@@ -1331,6 +1355,7 @@ impl App {
                     title: "欢迎使用 Rust RSS 阅读器".to_string(),
                     url: "example://welcome".to_string(),
                     group: "默认分组".to_string(),
+                    group_id: None,
                     description: "这是一个示例订阅源，请点击'添加订阅源'按钮添加您自己的RSS源"
                         .to_string(),
                     last_updated: None,
@@ -1540,33 +1565,39 @@ impl App {
 
                 tokio::spawn(async move {
                     log::debug!("后台索引任务开始执行");
-                    let storage_lock = storage_clone.lock().await;
-
+                    
                     // 收集所有文章用于批量添加到搜索索引
                     let mut all_articles = Vec::new();
+                    
+                    // 先获取storage锁，收集所有文章
+                    {
+                        log::debug!("获取storage锁");
+                        let storage_lock = storage_clone.lock().await;
+                        log::debug!("成功获取storage锁");
 
-                    // 加载所有订阅源的文章并收集
-                    log::debug!("开始加载所有订阅源的文章用于构建搜索索引");
-                    for feed in &final_feeds_clone {
-                        if feed.id > 0 {
-                            // 只处理有效的数据库订阅源
-                            log::debug!("加载订阅源(ID: {})的文章用于索引", feed.id);
-                            match storage_lock.get_articles_by_feed(feed.id).await {
-                                Ok(more_articles) => {
-                                    log::debug!(
-                                        "成功加载订阅源 {} 的 {} 篇文章用于索引",
-                                        feed.title,
-                                        more_articles.len()
-                                    );
-                                    // 将这些文章添加到总集合
-                                    all_articles.extend(more_articles.clone());
-                                }
-                                Err(e) => {
-                                    log::error!("加载订阅源 {} 的文章失败: {}", feed.title, e);
+                        // 加载所有订阅源的文章并收集
+                        log::debug!("开始加载所有订阅源的文章用于构建搜索索引");
+                        for feed in &final_feeds_clone {
+                            if feed.id > 0 {
+                                // 只处理有效的数据库订阅源
+                                log::debug!("加载订阅源(ID: {})的文章用于索引", feed.id);
+                                match storage_lock.get_articles_by_feed(feed.id).await {
+                                    Ok(more_articles) => {
+                                        log::debug!(
+                                            "成功加载订阅源 {} 的 {} 篇文章用于索引",
+                                            feed.title,
+                                            more_articles.len()
+                                        );
+                                        // 将这些文章添加到总集合
+                                        all_articles.extend(more_articles.clone());
+                                    }
+                                    Err(e) => {
+                                        log::error!("加载订阅源 {} 的文章失败: {}", feed.title, e);
+                                    }
                                 }
                             }
                         }
-                    }
+                    } // storage_lock超出作用域，自动释放
 
                     let total_articles_added = all_articles.len();
                     log::info!("总共收集到 {} 篇文章用于构建搜索索引", total_articles_added);
@@ -1580,11 +1611,10 @@ impl App {
 
                     // 批量添加所有文章到搜索索引
                     log::info!("开始批量添加 {} 篇文章到搜索索引", total_articles_added);
-                    search_manager_clone
-                        .lock()
-                        .await
-                        .add_articles(all_articles)
-                        .await;
+                    log::debug!("获取search_manager锁");
+                    let search_lock = search_manager_clone.lock().await;
+                    log::debug!("成功获取search_manager锁");
+                    search_lock.add_articles(all_articles).await;
                     log::info!("总共将 {} 篇文章添加到搜索索引", total_articles_added);
 
                     // 发送索引完成消息
@@ -3061,35 +3091,40 @@ impl eframe::App for App {
 
                 tokio::spawn(async move {
                     // 直接在闭包中实现刷新所有订阅源的逻辑
-                    let feeds = match feed_manager.lock().await.get_all_feeds().await {
-                        Ok(feeds) => feeds,
-                        Err(e) => {
-                            log::error!("Failed to auto refresh feeds: {}", e);
-                            if let Err(e) = ui_tx.send(UiMessage::Error(e.to_string())) {
-                                log::error!("发送错误消息失败: {}", e);
+                    // 先获取所有订阅源，然后释放feed_manager锁
+                    let feeds = {
+                        log::debug!("获取feed_manager锁");
+                        let feed_manager_lock = feed_manager.lock().await;
+                        log::debug!("成功获取feed_manager锁");
+                        match feed_manager_lock.get_all_feeds().await {
+                            Ok(feeds) => feeds,
+                            Err(e) => {
+                                log::error!("Failed to auto refresh feeds: {}", e);
+                                if let Err(e) = ui_tx.send(UiMessage::Error(e.to_string())) {
+                                    log::error!("发送错误消息失败: {}", e);
+                                }
+                                return;
                             }
-                            return;
                         }
                     };
 
                     for feed in feeds {
                         // 获取订阅源内容
-                        match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
-                            Ok(articles) => {
-                                // 存储文章
-                                if let Err(e) =
-                                    storage.lock().await.add_articles(feed.id, articles).await
-                                {
-                                    log::error!(
-                                        "Failed to parse and store articles for feed {}: {}",
-                                        feed.title,
-                                        e
-                                    );
-                                }
-                            }
+                        let articles = match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
+                            Ok(articles) => articles,
                             Err(e) => {
-                                log::error!("Failed to fetch RSS for feed {}: {}", feed.title, e);
+                                log::error!("Failed to fetch feed {}: {}", feed.title, e);
+                                continue;
                             }
+                        };
+                        
+                        // 存储文章
+                        if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
+                            log::error!(
+                                "Failed to parse and store articles for feed {}: {}",
+                                feed.title,
+                                e
+                            );
                         }
                     }
 
@@ -3225,29 +3260,40 @@ impl eframe::App for App {
                         let ui_tx = self.ui_tx.clone();
                         tokio::spawn(async move {
                             // 直接在闭包中实现刷新所有订阅源的逻辑
-                            if let Ok(feeds) = feed_manager.lock().await.get_all_feeds().await {
-                                for feed in feeds {
-                                    // 获取更新前的文章
-                                                    let old_articles = {
-                                                        let storage_lock = storage.lock().await;
-                                                        storage_lock.get_articles_by_feed(feed.id).await.unwrap_or_default()
-                                                    };
-                                                    let old_article_count = old_articles.len();
-                                    
-                                    // 获取订阅源内容
-                                    match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
-                                        Ok(articles) => {
-                                            // 存储文章
-                                            if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
-                                                log::error!("Failed to parse and store articles for feed {}: {}", feed.title, e);
-                                            } else {
-                                                // 获取更新后的文章数量
-                                                let new_articles = storage.lock().await.get_articles_by_feed(feed.id).await.unwrap_or_default();
-                                                let current_article_count = new_articles.len();
-                                                
-                                                // 检查是否有新文章
-                                                if current_article_count > old_article_count {
-                                                    // 获取真正的新文章
+                            // 先获取所有订阅源，释放feed_manager锁
+                            let feeds = {
+                                let feed_manager_lock = feed_manager.lock().await;
+                                match feed_manager_lock.get_all_feeds().await {
+                                    Ok(feeds) => feeds,
+                                    Err(e) => {
+                                        log::error!("Failed to get feeds: {}", e);
+                                        return;
+                                    }
+                                }
+                            }; // feed_manager_lock超出作用域，自动释放
+                                
+                            for feed in feeds {
+                                // 获取更新前的文章
+                                let old_articles = {
+                                    let storage_lock = storage.lock().await;
+                                    storage_lock.get_articles_by_feed(feed.id).await.unwrap_or_default()
+                                };
+                                let old_article_count = old_articles.len();
+                                
+                                // 获取订阅源内容
+                                match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
+                                    Ok(articles) => {
+                                        // 存储文章
+                                        if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
+                                            log::error!("Failed to parse and store articles for feed {}: {}", feed.title, e);
+                                        } else {
+                                            // 获取更新后的文章数量
+                                            let new_articles = storage.lock().await.get_articles_by_feed(feed.id).await.unwrap_or_default();
+                                            let current_article_count = new_articles.len();
+                                            
+                                            // 检查是否有新文章
+                                            if current_article_count > old_article_count {
+                                                // 获取真正的新文章
                                                     let added_articles = article_processor::get_new_articles(&old_articles, &new_articles);
                                                     let new_count = added_articles.len();
                                                     
@@ -3277,15 +3323,11 @@ impl eframe::App for App {
                                         },
                                         Err(e) => {
                                             log::error!("Failed to fetch RSS for feed {}: {}", feed.title, e);
-                                        }
-                                    }
-                                }
-                            } else {
-                                log::error!("Failed to refresh all feeds: failed to get feeds");
+                                        }}
                             }
-                            
-                            // 发送全部更新完成消息，触发文章列表重新加载
-                            let _ = ui_tx.send(UiMessage::AllFeedsRefreshed);
+                        
+                        // 发送全部更新完成消息，触发文章列表重新加载
+                        let _ = ui_tx.send(UiMessage::AllFeedsRefreshed);
                         });
                         ui.close();
                     }
@@ -4245,6 +4287,42 @@ impl eframe::App for App {
                         }
                     }
                     
+                    if ui.button("批量已读").clicked() {
+                        if self.selected_articles.is_empty() {
+                            self.status_message = "请先选择要操作的文章".to_string();
+                        } else {
+                            let article_ids: Vec<i64> = self.selected_articles.iter().copied().collect();
+                            let storage_clone = Arc::clone(&self.storage);
+                            let ui_tx_clone = self.ui_tx.clone();
+                            
+                            tokio::spawn(async move {
+                                let mut storage = storage_clone.lock().await;
+                                if let Ok(_) = storage.mark_articles_as_read(&article_ids).await {
+                                    let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量标记为已读".to_string()));
+                                    let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
+                                }
+                            });
+                        }
+                    }
+                    
+                    if ui.button("批量删除").clicked() {
+                        if self.selected_articles.is_empty() {
+                            self.status_message = "请先选择要删除的文章".to_string();
+                        } else {
+                            let article_ids: Vec<i64> = self.selected_articles.iter().copied().collect();
+                            let storage_clone = Arc::clone(&self.storage);
+                            let ui_tx_clone = self.ui_tx.clone();
+                            
+                            tokio::spawn(async move {
+                                let mut storage = storage_clone.lock().await;
+                                if let Ok(_) = storage.delete_articles(&article_ids).await {
+                                    let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量删除".to_string()));
+                                    let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
+                                }
+                            });
+                        }
+                    }
+                    
                     ui.label(format!("已选择: {} 篇文章", self.selected_articles.len()));
                 });
                 
@@ -4752,16 +4830,30 @@ impl eframe::App for App {
 
                             // 异步更新分组名称
                             tokio::spawn(async move {
-                                if let Err(e) = feed_manager
-                                    .lock()
-                                    .await
-                                    .rename_group(&old_name, &new_name)
-                                    .await
-                                {
-                                    log::error!("Failed to rename group: {}", e);
+                                log::debug!("开始更新分组名称，旧名称: '{}', 新名称: '{}'", old_name, new_name);
+                                
+                                // 只获取一次feed_manager锁
+                                let feed_manager_lock = feed_manager.lock().await;
+                                
+                                // 通过名称获取分组ID
+                                if let Ok(Some(group_id)) = feed_manager_lock.get_group_id_by_name(&old_name).await {
+                                    log::debug!("成功获取分组ID: {}，对应旧名称: '{}'", group_id, old_name);
+                                    
+                                    // 调用rename_group方法，使用分组ID
+                                    log::debug!("开始调用rename_group方法，分组ID: {}, 新名称: '{}'", group_id, new_name);
+                                    if let Err(e) = feed_manager_lock.rename_group(group_id, &new_name).await {
+                                        log::error!("调用rename_group失败: {}，分组ID: {}, 新名称: '{}'", e, group_id, new_name);
+                                    } else {
+                                        log::debug!("成功更新分组名称，分组ID: {}, 旧名称: '{}', 新名称: '{}'", group_id, old_name, new_name);
+                                        // 发送消息通知UI更新
+                                        if let Err(e) = ui_tx.send(UiMessage::AllFeedsRefreshed) {
+                                            log::error!("发送AllFeedsRefreshed消息失败: {}", e);
+                                        } else {
+                                            log::debug!("成功发送AllFeedsRefreshed消息");
+                                        }
+                                    }
                                 } else {
-                                    // 发送消息通知UI更新
-                                    let _ = ui_tx.send(UiMessage::AllFeedsRefreshed);
+                                    log::error!("获取分组ID失败，旧名称: '{}'", old_name);
                                 }
                             });
 
@@ -4770,11 +4862,13 @@ impl eframe::App for App {
                             self.editing_group_name.clear();
                             self.new_group_name.clear();
 
+
                             // 清除分组缓存，强制重新计算分组
                         }
 
                         if ui.button("取消").clicked() {
                             self.show_edit_group_dialog = false;
+
                             self.editing_group_name.clear();
                             self.new_group_name.clear();
                         }
@@ -5367,7 +5461,7 @@ async fn delete_article_async(
 
     // 删除文章
     storage.delete_article(article_id).await?;
-
+    drop(storage);
     // 加载配置，判断是否需要更新搜索索引
     let config = crate::config::AppConfig::load_or_default();
     if config.search_mode == "index_search" {
@@ -5392,7 +5486,7 @@ async fn delete_all_articles_async(
 ) -> anyhow::Result<()> {
     let mut storage = storage.lock().await;
     storage.delete_all_articles(feed_id).await?;
-
+     drop(storage);
     // 加载配置，判断是否需要更新搜索索引
     let config = crate::config::AppConfig::load_or_default();
     if config.search_mode == "index_search" {

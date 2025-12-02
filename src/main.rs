@@ -59,7 +59,7 @@ fn main() -> Result<(), eframe::Error> {
     test_db_init::test_database_initialization();
     println!("[数据库测试] 测试完成\n");
 
-    // 配置日志，设置级别为info以减少调试日志输出
+    // 配置日志，设置级别为info以减少调试日志输出 debug
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // 创建Tokio运行时以支持异步操作

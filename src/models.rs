@@ -18,6 +18,9 @@ pub struct Feed {
     /// 分组名称
     pub group: String,
 
+    /// 分组ID
+    pub group_id: Option<i64>,
+
     /// 最后更新时间
     pub last_updated: Option<DateTime<Utc>>,
 

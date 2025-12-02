@@ -2,6 +2,8 @@
 
 use dirs;
 use futures::StreamExt;
+use html_escape::decode_html_entities;
+use ammonia::{Builder, UrlRelative};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, remove_file};
@@ -321,14 +323,53 @@ impl AIClient {
         self.chat_completion(&messages, Some(0.3), None, None).await
     }
 
+    /// 清理HTML内容，只保留p和br标签，移除所有其他HTML标签
+    fn sanitize_content(&self, html: &str) -> String {
+        // 创建ammonia构建器
+        let mut builder = Builder::new();
+        
+        // 只允许p和br标签
+        let allowed_tags = std::collections::HashSet::from(["p", "br"]);
+        builder.tags(allowed_tags);
+        
+        // 不允许任何属性
+        builder.tag_attributes(std::collections::HashMap::new());
+        
+        // 不允许任何协议处理
+        builder.url_relative(UrlRelative::PassThrough);
+        
+        // 不允许任何链接处理
+        builder.link_rel(None);
+        
+        // 清理HTML内容
+        let sanitized_html = builder.clean(html).to_string();
+        
+        // 解码HTML实体
+        let decoded = decode_html_entities(&sanitized_html);
+        
+        // 移除多余的空白字符，保留合理的换行和空格
+        let cleaned = decoded
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        cleaned
+    }
+
     /// 翻译文章标题和内容为中文
     pub async fn translate_article(
         &self,
         title: &str,
         content: &str,
     ) -> Result<(String, String), AIClientError> {
-        let title_prompt = format!("请将以下文章标题翻译成中文，保持原意准确，语言流畅自然：\n\n{}", title);
-        let content_prompt = format!("请将以下文章内容翻译成中文，保持原意准确，语言流畅自然：\n\n{}", content);
+        // 清理标题和内容，确保发送给AI的是纯文本
+        let cleaned_title = self.sanitize_content(title);
+        let cleaned_content = self.sanitize_content(content);
+
+        let title_prompt = format!("请将以下文章标题翻译成中文，保持原意准确，语言流畅自然：\n\n{}", cleaned_title);
+        let content_prompt = format!("请将以下文章内容翻译成中文，保持原意准确，语言流畅自然：\n\n{}", cleaned_content);
 
         let title_messages = vec![
             AIMessage::system("你是一个专业的翻译官。请将文本翻译成中文，保持原意准确，语言流畅自然。不要添加任何解释或其他内容，仅返回翻译结果。"),

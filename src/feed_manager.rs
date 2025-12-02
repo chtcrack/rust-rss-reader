@@ -48,6 +48,7 @@ impl FeedManager {
             title: title.trim().to_string(),
             url: url.trim().to_string(),
             group: group.trim().to_string(),
+            group_id: None,
             last_updated: None,
             description: String::new(),
             language: String::new(),
@@ -83,30 +84,8 @@ impl FeedManager {
     #[allow(unused)]
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
         let storage = self.storage.lock().await;
-        let feeds = storage.get_all_feeds().await?;
-
-        // 收集所有唯一的分组名称
-        let mut groups = std::collections::HashSet::new();
-        for feed in feeds {
-            if !feed.group.is_empty() {
-                groups.insert(feed.group);
-            }
-        }
-
-        // 转换为FeedGroup向量并排序
-        let mut result: Vec<FeedGroup> = groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| FeedGroup {
-                id: (index + 1) as i64, // 简单地使用索引作为ID
-                name,
-                icon: None,
-            })
-            .collect();
-
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-
-        Ok(result)
+        // 直接从数据库获取所有分组，包含真实的ID
+        storage.get_all_groups().await
     }
 
     /// 更新RSS源
@@ -207,37 +186,40 @@ impl FeedManager {
     }
 
     /// 重命名分组
-    #[allow(unused)]
-    pub async fn rename_group(&self, old_name: &str, new_name: &str) -> anyhow::Result<()> {
+   
+    pub async fn rename_group(&self, group_id: i64, new_name: &str) -> anyhow::Result<()> {
         let new_name_trimmed = new_name.trim();
         if new_name_trimmed.is_empty() {
             return Err(anyhow::anyhow!("分组名称不能为空"));
         }
-
+        log::debug!("feed_manger获取分组ID: {}，对应新名称: '{}'", group_id, new_name);
         let mut storage = self.storage.lock().await;
 
         // 调用StorageManager的update_group_name方法，同时更新feed_groups表和所有相关订阅源
         storage
-            .update_group_name(old_name, new_name_trimmed)
+            .update_group_name(group_id, new_name_trimmed)
             .await?;
 
         Ok(())
     }
+    
+    /// 通过名称获取分组ID
+    #[allow(unused)]
+    pub async fn get_group_id_by_name(&self, group_name: &str) -> anyhow::Result<Option<i64>> {
+        let storage = self.storage.lock().await;
+        let groups = storage.get_all_groups().await?;
+        
+        Ok(groups.into_iter().find(|g| g.name == group_name).map(|g| g.id))
+    }
 
     /// 删除分组（将所有属于该分组的订阅源移动到未分组）
     #[allow(unused)]
-    pub async fn delete_group(&self, group_name: &str) -> anyhow::Result<()> {
+    pub async fn delete_group(&self, group_id: i64) -> anyhow::Result<()> {
         let mut storage = self.storage.lock().await;
-        let mut feeds = storage.get_all_feeds().await?;
-
+        
         // 将所有属于该分组的订阅源移动到未分组
-        for feed in feeds.iter_mut() {
-            if feed.group == group_name {
-                feed.group = String::new();
-                storage.update_feed(feed).await?;
-            }
-        }
-
+        storage.delete_group(group_id).await?;
+        
         Ok(())
     }
 

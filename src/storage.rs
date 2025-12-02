@@ -5,9 +5,12 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use ammonia::{Builder, UrlRelative};
+use html_escape::decode_html_entities;
 
 /// 存储管理器
 pub struct StorageManager {
@@ -16,6 +19,69 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
+    /// 清理HTML内容，只保留p和br标签，移除所有其他HTML标签
+    fn sanitize_html(html: &str) -> String {
+        // 首先检查输入是否为空
+        if html.is_empty() {
+            return String::new();
+        }
+        
+        // 尝试处理HTML内容，添加错误处理
+        match std::panic::catch_unwind(|| {
+            // 创建ammonia构建器
+            let mut builder = Builder::new();
+            
+            // 只允许p和br标签
+            let allowed_tags = HashSet::from(["p", "br"]);
+            builder.tags(allowed_tags);
+            
+            // 不允许任何属性
+            builder.tag_attributes(HashMap::new());
+            
+            // 不允许任何协议处理
+            builder.url_relative(UrlRelative::PassThrough);
+            
+            // 不允许任何链接处理
+            builder.link_rel(None);
+            
+            // 清理HTML内容
+            let sanitized_html = builder.clean(html).to_string();
+            
+            // 解码HTML实体
+            let decoded = decode_html_entities(&sanitized_html);
+            
+            // 移除多余的空白字符，保留合理的换行和空格
+            let cleaned = decoded
+                .lines()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            cleaned
+        }) {
+            Ok(cleaned_content) => cleaned_content,
+            Err(_) => {
+                // 如果处理失败，尝试使用更简单的方式处理
+                log::warn!("HTML清理失败，使用简单处理方式");
+                // 解码HTML实体
+                let decoded = decode_html_entities(html);
+                // 移除HTML标签
+                let simple_cleaned = regex::Regex::new(r"<[^>]*>")
+                    .unwrap_or_else(|_| regex::Regex::new(r"").unwrap())
+                    .replace_all(&decoded, "")
+                    .to_string();
+                // 移除多余的空白字符
+                simple_cleaned
+                    .lines()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+
     /// 创建新的存储管理器
     pub fn new(db_path: String) -> Self {
         // 尝试连接数据库，如果失败则尝试创建
@@ -132,6 +198,15 @@ impl StorageManager {
             )?;
         }
 
+        // 检查并添加group_id字段（如果不存在）
+        let has_group_id = table_info.iter().any(|col| col == "group_id");
+        if !has_group_id {
+            conn.execute(
+                "ALTER TABLE feeds ADD COLUMN group_id INTEGER DEFAULT NULL",
+                [],
+            )?;
+        }
+
         // 创建文章表
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS articles (
@@ -179,6 +254,12 @@ impl StorageManager {
             "CREATE INDEX IF NOT EXISTS idx_articles_link_feed ON articles(link, feed_id)",
             [],
         )?;
+        
+        // 为feeds表的group_id字段添加索引，提高分组查询性能
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feeds_group_id ON feeds(group_id)",
+            [],
+        )?;
 
         // 创建设置表
         conn.execute(
@@ -195,25 +276,61 @@ impl StorageManager {
     /// 添加新的订阅源
     #[allow(unused)]
     pub async fn add_feed(&mut self, feed: Feed) -> anyhow::Result<i64> {
-        let conn = self.connection.lock().await;
-
+        let mut conn = self.connection.lock().await;
+        
         // 检查是否已存在相同URL的订阅源
-        let mut stmt = conn.prepare("SELECT id FROM feeds WHERE url = ?")?;
-        if let Ok(Some(id)) = stmt
-            .query_row(params![&feed.url], |row| row.get(0))
-            .optional()
-        {
-            return Ok(id); // 返回已存在的ID
+        { // 新作用域，确保stmt在事务开始前被删除
+            let mut stmt = conn.prepare("SELECT id FROM feeds WHERE url = ?")?;
+            if let Ok(Some(id)) = stmt
+                .query_row(params![&feed.url], |row| row.get(0))
+                .optional()
+            {
+                return Ok(id); // 返回已存在的ID
+            }
         }
+        
+        // 开始事务
+        let tx = conn.transaction()?;
+        
+        // 处理分组逻辑
+        let group_id = if feed.group.is_empty() {
+            // 空分组，使用NULL
+            None
+        } else {
+            // 查询是否已存在同名分组
+            let mut group_stmt = tx.prepare("SELECT id FROM feed_groups WHERE name = ?")?;
+            let group_exists = group_stmt
+                .query_row(params![&feed.group], |row| row.get::<_, i64>(0))
+                .optional()?;
+            
+            if let Some(id) = group_exists {
+                Some(id)
+            } else {
+                // 不存在，插入新分组
+                tx.execute(
+                    "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
+                    params![feed.group, None::<&str>],
+                )?;
+                
+                // 获取插入的ID或已存在的ID
+                let new_group_id = tx.query_row(
+                    "SELECT id FROM feed_groups WHERE name = ?",
+                    params![&feed.group],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                
+                Some(new_group_id)
+            }
+        };
 
         // 添加新订阅源，包含last_updated字段
-        let _result = conn.execute(
-            "INSERT INTO feeds (title, url, group_name, description, language, link, favicon, last_updated, auto_update, enable_notification, ai_auto_translate) 
+        let _result = tx.execute(
+            "INSERT INTO feeds (title, url, group_id, description, language, link, favicon, last_updated, auto_update, enable_notification, ai_auto_translate) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 feed.title,
                 feed.url,
-                feed.group,
+                group_id,
                 feed.description,
                 feed.language,
                 feed.link,
@@ -226,7 +343,10 @@ impl StorageManager {
         )?;
 
         // 获取插入的ID
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
+        
+        // 提交事务
+        tx.commit()?;
 
         Ok(id)
     }
@@ -237,8 +357,8 @@ impl StorageManager {
         let conn = self.connection.lock().await;
 
         let mut stmt = conn.prepare(
-            "SELECT id, title, url, group_name, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate 
-             FROM feeds ORDER BY group_name, title"
+            "SELECT f.id, f.title, f.url, COALESCE(g.name, '') as group_name, f.group_id, f.last_updated, f.description, f.language, f.link, f.favicon, f.auto_update, f.enable_notification, f.ai_auto_translate 
+             FROM feeds f LEFT JOIN feed_groups g ON f.group_id = g.id ORDER BY g.name, f.title"
         )?;
 
         let feeds = stmt
@@ -248,14 +368,15 @@ impl StorageManager {
                     title: row.get(1)?,
                     url: row.get(2)?,
                     group: row.get(3)?,
-                    last_updated: row.get(4)?,
-                    description: row.get(5)?,
-                    language: row.get(6)?,
-                    link: row.get(7)?,
-                    favicon: row.get(8)?,
-                    auto_update: row.get(9)?,
-                    enable_notification: row.get(10)?,
-                    ai_auto_translate: row.get(11)?,
+                    group_id: row.get(4)?,
+                    last_updated: row.get(5)?,
+                    description: row.get(6)?,
+                    language: row.get(7)?,
+                    link: row.get(8)?,
+                    favicon: row.get(9)?,
+                    auto_update: row.get(10)?,
+                    enable_notification: row.get(11)?,
+                    ai_auto_translate: row.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<Feed>>>()?;
@@ -263,18 +384,152 @@ impl StorageManager {
         Ok(feeds)
     }
 
+    /// 执行数据迁移，将group_name映射为group_id
+    pub async fn migrate_feed_group_ids(&mut self) -> anyhow::Result<()> {
+        let mut conn = self.connection.lock().await;
+        
+        // 开始事务
+        let tx = conn.transaction()?;
+        
+        // 1. 首先获取feeds表中所有唯一的group_name值
+        let unique_group_names = {
+            let mut stmt = tx.prepare("SELECT DISTINCT group_name FROM feeds WHERE group_name != ''")?;
+            stmt
+                .query_map([], |row| {
+                    Ok(row.get::<_, String>(0)?)
+                })?
+                .collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        
+        // 2. 确保feed_groups表中存在所有这些分组
+        let mut group_name_to_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        
+        // 先获取现有的分组
+        let existing_groups = {
+            let mut stmt = tx.prepare("SELECT id, name FROM feed_groups")?;
+            stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<(i64, String)>>>()?
+        };
+        
+        // 添加到映射表
+        for (id, name) in existing_groups {
+            group_name_to_id.insert(name, id);
+        }
+        
+        // 3. 为不存在的分组创建记录
+        for group_name in &unique_group_names {
+            if !group_name_to_id.contains_key(group_name) && !group_name.is_empty() {
+                // 插入新分组
+                tx.execute(
+                    "INSERT INTO feed_groups (name) VALUES (?)",
+                    params![group_name],
+                )?;
+                
+                // 获取插入的ID
+                let group_id = tx.last_insert_rowid();
+                
+                // 添加到映射表
+                group_name_to_id.insert(group_name.clone(), group_id);
+            }
+        }
+        
+        // 4. 遍历所有订阅源，更新group_id
+        let feeds = {
+            let mut feed_stmt = tx.prepare("SELECT id, group_name FROM feeds WHERE group_id IS NULL OR group_id = 0")?;
+            feed_stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<(i64, String)>>>()?
+        };
+        
+        for (feed_id, group_name) in feeds {
+            if let Some(group_id) = group_name_to_id.get(&group_name) {
+                // 更新feed的group_id
+                tx.execute(
+                    "UPDATE feeds SET group_id = ? WHERE id = ?",
+                    params![group_id, feed_id],
+                )?;
+            }
+        }
+        
+        // 提交事务
+        tx.commit()?;
+        
+        Ok(())
+    }
+    
+    /// 清理工作：移除feeds表中的group_name字段
+    
+    pub async fn cleanup_group_name_field(&mut self) -> anyhow::Result<()> {
+        let  conn = self.connection.lock().await;
+        
+        // 检查group_name字段是否存在
+        let mut stmt = conn.prepare("PRAGMA table_info(feeds)")?;
+        let table_info: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        
+        if table_info.contains(&"group_name".to_string()) {
+            // 移除group_name字段
+            conn.execute("ALTER TABLE feeds DROP COLUMN group_name", [])?;
+            log::info!("成功移除feeds表中的group_name字段");
+        } else {
+            log::info!("feeds表中不存在group_name字段，无需移除");
+        }
+        
+        Ok(())
+    }
+
     /// 更新订阅源信息
 
     pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let mut conn = self.connection.lock().await;
+        
+        // 开始事务
+        let tx = conn.transaction()?;
+        
+        // 处理分组逻辑
+        let group_id = if feed.group.is_empty() {
+            // 空分组，使用NULL
+            None
+        } else {
+            // 查询是否已存在同名分组
+            let mut group_stmt = tx.prepare("SELECT id FROM feed_groups WHERE name = ?")?;
+            let group_exists = group_stmt
+                .query_row(params![&feed.group], |row| row.get::<_, i64>(0))
+                .optional()?;
+            
+            if let Some(id) = group_exists {
+                Some(id)
+            } else {
+                // 不存在，插入新分组
+                tx.execute(
+                    "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
+                    params![feed.group, None::<&str>],
+                )?;
+                
+                // 获取插入的ID或已存在的ID
+                let new_group_id = tx.query_row(
+                    "SELECT id FROM feed_groups WHERE name = ?",
+                    params![&feed.group],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                
+                Some(new_group_id)
+            }
+        };
 
-        conn.execute(
-            "UPDATE feeds SET title = ?, url = ?, group_name = ?, description = ?, 
+        tx.execute(
+            "UPDATE feeds SET title = ?, url = ?, group_id = ?, description = ?, 
              language = ?, link = ?, favicon = ?, auto_update = ?, enable_notification = ?, ai_auto_translate = ? WHERE id = ?",
             params![
                 feed.title,
                 feed.url,
-                feed.group,
+                group_id,
                 feed.description,
                 feed.language,
                 feed.link,
@@ -285,6 +540,9 @@ impl StorageManager {
                 feed.id
             ],
         )?;
+        
+        // 提交事务
+        tx.commit()?;
 
         Ok(())
     }
@@ -337,17 +595,10 @@ impl StorageManager {
     pub async fn delete_group(&mut self, group_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
-        // 首先获取要删除的分组名称
-        let group_name: String = conn.query_row(
-            "SELECT name FROM feed_groups WHERE id = ?",
-            params![group_id],
-            |row| row.get(0),
-        )?;
-
-        // 先将使用此分组的订阅源的分组名设为空
+        // 先将使用此分组的订阅源的group_id设为NULL
         conn.execute(
-            "UPDATE feeds SET group_name = '' WHERE group_name = ?",
-            params![group_name],
+            "UPDATE feeds SET group_id = NULL WHERE group_id = ?",
+            params![group_id],
         )?;
 
         // 删除分组
@@ -386,34 +637,34 @@ impl StorageManager {
     #[allow(unused)]
     pub async fn update_group_name(
         &mut self,
-        old_name: &str,
+        group_id: i64,
         new_name: &str,
     ) -> anyhow::Result<()> {
-        let mut conn = self.connection.lock().await;
-
-        // 验证新名称不为空
-        if new_name.trim().is_empty() {
-            return Err(anyhow::anyhow!("分组名称不能为空"));
-        }
-
-        // 开始事务
-        let tx = conn.transaction()?;
-
-        // 更新feed_groups表中的分组名称
-        tx.execute(
-            "UPDATE feed_groups SET name = ? WHERE name = ?",
-            params![new_name.trim(), old_name],
+        log::debug!("[update_group_name] 开始执行，group_id: {}, new_name: '{}'", group_id, new_name);
+        
+      let conn = self.connection.lock().await;
+        
+        // 更新订阅源的group_id
+        conn.execute(
+            "UPDATE feed_groups SET name = ? WHERE id = ?",
+            params![new_name, group_id],
         )?;
-
-        // 更新所有使用该分组的订阅源的group_name字段
-        tx.execute(
-            "UPDATE feeds SET group_name = ? WHERE group_name = ?",
-            params![new_name.trim(), old_name],
+        
+        
+        Ok(())
+    }
+    
+    /// 通过group_id更新订阅源的分组信息
+    #[allow(unused)]
+    pub async fn update_feed_group(&mut self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
+        let conn = self.connection.lock().await;
+        
+        // 更新订阅源的group_id
+        conn.execute(
+            "UPDATE feeds SET group_id = ? WHERE id = ?",
+            params![group_id, feed_id],
         )?;
-
-        // 提交事务
-        tx.commit()?;
-
+        
         Ok(())
     }
 
@@ -745,17 +996,21 @@ impl StorageManager {
             // 插入或更新订阅源
             tx.execute(
                 "INSERT OR REPLACE INTO feeds 
-                 (title, url, group_name, last_updated, description, language, link, favicon) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (title, url, group_name, group_id, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     feed.title,
                     feed.url,
                     feed.group,
+                    feed.group_id,
                     feed.last_updated,
                     feed.description,
                     feed.language,
                     feed.link,
-                    feed.favicon
+                    feed.favicon,
+                    feed.auto_update as i8,
+                    feed.enable_notification as i8,
+                    feed.ai_auto_translate as i8
                 ],
             )?;
 
@@ -842,6 +1097,11 @@ impl StorageManager {
                 .is_ok();
 
             if !exists {
+                // 清理文章内容和摘要
+                let cleaned_content = Self::sanitize_html(&article.content);
+                let cleaned_summary = Self::sanitize_html(&article.summary);
+                let cleaned_title = decode_html_entities(&article.title).to_string();
+                
                 // 添加新文章，使用INSERT OR IGNORE避免唯一约束错误
                 let result = tx.execute(
                     "INSERT OR IGNORE INTO articles (feed_id, title, link, author, pub_date, content, 
@@ -849,12 +1109,12 @@ impl StorageManager {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         feed_id,
-                        article.title,
+                        cleaned_title,
                         article.link,
                         article.author,
                         article.pub_date,
-                        article.content,
-                        article.summary,
+                        cleaned_content,
+                        cleaned_summary,
                         article.is_read as i32,
                         article.is_starred as i32,
                         article.source,
@@ -1028,6 +1288,18 @@ impl StorageManager {
         Ok(())
     }
 
+    /// 批量标记指定ID的文章为已读
+    pub async fn mark_articles_as_read(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
+        let conn = self.connection.lock().await;
+        for &id in article_ids {
+            conn.execute(
+                "UPDATE articles SET is_read = 1 WHERE id = ?",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// 删除单篇文章
 
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
@@ -1051,6 +1323,15 @@ impl StorageManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// 批量删除指定ID的文章
+    pub async fn delete_articles(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
+        let conn = self.connection.lock().await;
+        for &id in article_ids {
+            conn.execute("DELETE FROM articles WHERE id = ?", params![id])?;
+        }
         Ok(())
     }
 }
