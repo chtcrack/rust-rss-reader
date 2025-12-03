@@ -4255,6 +4255,116 @@ impl eframe::App for App {
             let end_idx = std::cmp::min(start_idx + self.page_size, total_articles);
             let current_page_articles = &articles_to_display[start_idx..end_idx];
             
+            // 键盘导航处理
+            let input = ui.input_mut(|i| i.clone());
+            let has_articles = !articles_to_display.is_empty();
+            
+            // 移除焦点检查，直接处理键盘事件
+            // 分页导航（左右方向键）
+            if has_articles {
+                if input.key_pressed(egui::Key::ArrowLeft) && self.current_page > 1 {
+                    self.current_page -= 1;
+                    // 切换页面后，默认选中第一篇文章
+                    let new_start_idx = (self.current_page - 1) * self.page_size;
+                    let new_end_idx = std::cmp::min(new_start_idx + self.page_size, total_articles);
+                    let new_page_articles = &articles_to_display[new_start_idx..new_end_idx];
+                    if !new_page_articles.is_empty() {
+                        self.selected_article_id = Some(new_page_articles[0].id);
+                        // 自动标记为已读
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                            if !article.is_read {
+                                let storage = self.storage.clone();
+                                let article_id = article.id;
+                                let ui_tx = self.ui_tx.clone();
+                                tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
+                            }
+                        }
+                    }
+                } else if input.key_pressed(egui::Key::ArrowRight) && self.current_page < total_pages {
+                    self.current_page += 1;
+                    // 切换页面后，默认选中第一篇文章
+                    let next_start_idx = (self.current_page - 1) * self.page_size;
+                    let next_end_idx = std::cmp::min(next_start_idx + self.page_size, total_articles);
+                    let next_page_articles = &articles_to_display[next_start_idx..next_end_idx];
+                    if !next_page_articles.is_empty() {
+                        self.selected_article_id = Some(next_page_articles[0].id);
+                        // 自动标记为已读
+                        if let Some(article) = next_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                            if !article.is_read {
+                                let storage = self.storage.clone();
+                                let article_id = article.id;
+                                let ui_tx = self.ui_tx.clone();
+                                tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 文章选择（上下方向键）
+            if has_articles && !current_page_articles.is_empty() {
+                if input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowDown) {
+                    // 找到当前选中文章在当前页的索引
+                    let current_index = if let Some(selected_id) = self.selected_article_id {
+                        current_page_articles.iter().position(|a| a.id == selected_id).unwrap_or(0)
+                    } else {
+                        // 如果没有选中文章，默认选中第一篇
+                        self.selected_article_id = Some(current_page_articles[0].id);
+                        0
+                    };
+                    
+                    // 计算新的索引
+                    let new_index = if input.key_pressed(egui::Key::ArrowUp) {
+                        // 向上导航
+                        if current_index > 0 {
+                            current_index - 1
+                        } else if self.current_page > 1 {
+                            // 如果是当前页的第一篇文章，切换到上一页的最后一篇
+                            self.current_page -= 1;
+                            // 计算上一页的最后一篇文章索引
+                            let prev_start_idx = (self.current_page - 1) * self.page_size;
+                            let prev_end_idx = std::cmp::min(prev_start_idx + self.page_size, total_articles);
+                            let prev_page_articles = &articles_to_display[prev_start_idx..prev_end_idx];
+                            prev_page_articles.len() - 1
+                        } else {
+                            // 已经是第一页的第一篇文章，保持不变
+                            0
+                        }
+                    } else {
+                        // 向下导航
+                        if current_index < current_page_articles.len() - 1 {
+                            current_index + 1
+                        } else if self.current_page < total_pages {
+                            // 如果是当前页的最后一篇文章，切换到下一页的第一篇
+                            self.current_page += 1;
+                            0
+                        } else {
+                            // 已经是最后一页的最后一篇文章，保持不变
+                            current_index
+                        }
+                    };
+                    
+                    // 获取新页面的文章列表
+                    let new_start_idx = (self.current_page - 1) * self.page_size;
+                    let new_end_idx = std::cmp::min(new_start_idx + self.page_size, total_articles);
+                    let new_page_articles = &articles_to_display[new_start_idx..new_end_idx];
+                    
+                    // 更新选中的文章
+                    if !new_page_articles.is_empty() && new_index < new_page_articles.len() {
+                        self.selected_article_id = Some(new_page_articles[new_index].id);
+                        // 自动标记为已读
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                            if !article.is_read {
+                                let storage = self.storage.clone();
+                                let article_id = article.id;
+                                let ui_tx = self.ui_tx.clone();
+                                tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
+                            }
+                        }
+                    }
+                }
+            }
+            
             // 检查是否正在建立搜索索引
             if self.is_indexing {
                 // 显示加载动画
@@ -4376,11 +4486,24 @@ impl eframe::App for App {
                                 self.show_ai_send_dialog = true;
                             }
                             
-                            // 使用selectable_label时，避免不必要的格式转换
-                            if ui.selectable_label(
-                                self.selected_article_id == Some(article.id), 
-                                title
-                            ).clicked() {
+                            // 为选中的文章添加更明显的视觉高亮效果
+                            let is_selected = self.selected_article_id == Some(article.id);
+                            let response = if is_selected {
+                                // 选中的文章使用更明显的样式
+                                let mut frame = egui::Frame::default();
+                                frame = frame.fill(ui.visuals().selection.bg_fill);
+                                frame = frame.stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
+                                frame = frame.inner_margin(egui::Margin::same(4)); // 使用整数而不是浮点数
+                                
+                                frame.show(ui, |ui| {
+                                    ui.selectable_label(true, title)
+                                }).inner
+                            } else {
+                                // 未选中的文章使用默认样式
+                                ui.selectable_label(false, title)
+                            };
+                            
+                            if response.clicked() {
                                 // 重置翻译相关状态
                                 self.is_translating = false;
                                 self.translated_article = None;
