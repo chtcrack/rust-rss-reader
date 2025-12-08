@@ -1,6 +1,6 @@
 [package]
 name = "rust_rss_reader"
-version = "1.0.7"
+version = "1.1.0"
 description = "A lightweight and high-performance RSS reader for Windows 10"
 authors = ["chtcrack <chtcrack@gmail.com>"]
 edition = "2024"
@@ -77,6 +77,7 @@ futures = "0.3.31"
 url = "2.5.7"
 rfd = "0.15.4"
 ammonia = "4.1.2"
+headless_chrome = {git = "https://github.com/rust-headless-chrome/rust-headless-chrome", features = ["fetch"]}
 
 [features]
 default = ["tray"]

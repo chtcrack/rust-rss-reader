@@ -579,24 +579,96 @@ impl AIChatSession {
         Ok(())
     }
 
-    /// 估算文本的token数量（简单估算：每个token约4个字符）
-    fn estimate_tokens(&self, text: &str) -> usize {
-        // 简单估算：每个token约4个字符
-        // 实际应用中可以使用更精确的tokenizer，如tiktoken
-        (text.len() + 3) / 4
+ fn estimate_tokens(&self, text: &str) -> usize {
+    let mut estimate = 0;
+    let mut ascii_word_len = 0;
+    
+    for c in text.chars() {
+        // 检查是否为中日韩字符
+        let is_cjk = self.is_cjk_char(c);
+        
+        if is_cjk {
+            if ascii_word_len > 0 {
+                estimate += self.estimate_ascii_word_tokens(ascii_word_len);
+                ascii_word_len = 0;
+            }
+            estimate += 1; // 大多数CJK字符是1个token
+        } else if c.is_ascii_alphanumeric() {
+            ascii_word_len += 1;
+        } else {
+            // 处理标点、空格等
+            if ascii_word_len > 0 {
+                estimate += self.estimate_ascii_word_tokens(ascii_word_len);
+                ascii_word_len = 0;
+            }
+            
+            match c {
+                ' ' | '\t' => estimate += 1, // 空格通常需要1个token
+                '\n' => estimate += 1,       // 换行符
+                _ => estimate += 1,          // 其他标点符号
+            }
+        }
     }
+    
+    if ascii_word_len > 0 {
+        estimate += self.estimate_ascii_word_tokens(ascii_word_len);
+    }
+    
+    // 确保最小值
+    estimate.max(1)
+}
 
-    /// 估算消息列表的总token数量
-    fn estimate_messages_tokens(&self, messages: &[AIMessage]) -> usize {
-        messages
-            .iter()
-            .map(|msg| {
-                // 每个消息的token数 = 角色token数 + 内容token数 + 分隔符token数
-                // 角色通常是固定的几个单词，估算为2个token
-                2 + self.estimate_tokens(&msg.content) + 3 // 3个token用于分隔符
-            })
-            .sum()
+fn is_cjk_char(&self, c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |     // 中文
+        '\u{3400}'..='\u{4DBF}' |     // 中文扩展A
+        '\u{20000}'..='\u{2A6DF}' |   // 中文扩展B
+        '\u{3040}'..='\u{309F}' |     // 平假名
+        '\u{30A0}'..='\u{30FF}' |     // 片假名
+        '\u{AC00}'..='\u{D7AF}' |     // 韩文
+        '\u{FF00}'..='\u{FFEF}'       // 全角字符
+    )
+}
+
+fn estimate_ascii_word_tokens(&self, word_len: usize) -> usize {
+    // 对于ASCII单词，使用更精确的估算
+    match word_len {
+        0 => 0,
+        1..=3 => 1,  // 短单词通常1个token
+        4..=7 => 2,  // 中等长度单词
+        8..=11 => 3,
+        _ => (word_len + 3) / 4, // 长单词按平均估算
     }
+}
+
+fn estimate_messages_tokens(&self, messages: &[AIMessage]) -> usize {
+    let mut total = 0;
+    
+    for msg in messages {
+        // 不同角色的基础token数不同
+        let role_tokens = match msg.role.as_str() {
+            "system" => 4,    // "system"通常4个token
+            "user" => 3,      // "user"通常3个token  
+            "assistant" => 4, // "assistant"通常4个token
+            _ => 3,
+        };
+        
+        let content_tokens = self.estimate_tokens(&msg.content);
+        
+        // 考虑消息格式（不同模型格式不同）
+        let format_tokens = match msg.role.as_str() {
+            "system" => 4,    // 系统消息额外格式token
+            "user" => 3,      // 用户消息格式
+            "assistant" => 3, // 助手消息格式
+            _ => 3,
+        };
+        
+        total += role_tokens + content_tokens + format_tokens;
+    }
+    
+    // 添加对话开始和结束的token
+    total + 2
+}
 
     /// 裁剪历史消息，确保总token数不超过模型限制
     fn trim_history(&mut self) {

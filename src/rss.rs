@@ -4,6 +4,7 @@ use crate::models::Article;
 use chrono::{DateTime, Utc};
 use encoding_rs;
 use flate2::read::GzDecoder;
+use headless_chrome::{Browser, LaunchOptionsBuilder};
 use html2text::from_read;
 use reqwest::Url;
 use roxmltree::Document;
@@ -298,10 +299,17 @@ impl RssFetcher {
 
         // 对于错误状态，我们只需要读取文本
         if !status.is_success() {
+            // 如果是403错误，尝试使用Headless Chrome获取
+            if status.as_u16() == 403 {
+                log::warn!("HTTP 403 Forbidden，尝试使用Headless Chrome获取RSS源: {}", url);
+                return self.fetch_feed_with_headless_chrome(url).await;
+            }
+            
             let error_text = response.text().await.unwrap_or_default();
             return Err(RssError::NetworkError(format!(
                 "HTTP error: {} - {}",
-                status, error_text
+                status,
+                error_text
             )));
         }
 
@@ -516,6 +524,105 @@ impl RssFetcher {
                 cache.remove(&key);
             }
         }
+    }
+
+    /// 使用Headless Chrome获取RSS源
+    async fn fetch_feed_with_headless_chrome(&self, url: &str) -> Result<Vec<Article>, RssError> {
+        log::info!("尝试使用Headless Chrome获取RSS源: {}", url);
+        
+        // 构建浏览器启动选项
+        let launch_options = LaunchOptionsBuilder::default()
+            .headless(false)
+            .build()
+            .map_err(|e| {
+                log::error!("构建浏览器启动选项失败: {:?}", e);
+                RssError::NetworkError(format!("Headless Chrome启动失败: {:?}", e))
+            })?;
+
+        // 启动浏览器
+        let browser = Browser::new(launch_options)
+            .map_err(|e| {
+                log::error!("启动Headless Chrome失败: {:?}", e);
+                RssError::NetworkError(format!("Headless Chrome启动失败: {:?}", e))
+            })?;
+
+        // 创建新标签页
+        let tab = browser.new_tab()
+            .map_err(|e| {
+                log::error!("创建新标签页失败: {:?}", e);
+                RssError::NetworkError(format!("创建标签页失败: {:?}", e))
+            })?;
+            
+
+        // 导航到RSS源URL
+        tab.navigate_to(url)
+            .map_err(|e| {
+                log::error!("导航到URL失败: {:?}", e);
+                RssError::NetworkError(format!("导航失败: {:?}", e))
+            })?;
+
+        // 等待页面加载完成
+        tab.wait_until_navigated()
+            .map_err(|e| {
+                log::error!("等待页面加载失败: {:?}", e);
+                RssError::NetworkError(format!("页面加载失败: {:?}", e))
+            })?;
+
+        // 获取页面内容
+        let page_content = tab.get_content()
+            .map_err(|e| {
+                log::error!("获取页面内容失败: {:?}", e);
+                RssError::NetworkError(format!("获取页面内容失败: {:?}", e))
+            })?;
+
+        log::info!("使用Headless Chrome获取到页面内容，长度: {} bytes", page_content.len());
+        log::info!("内容预览: {:?}", &page_content[..std::cmp::min(page_content.len(), 200)]);
+
+        // 尝试从HTML中提取RSS内容
+        let rss_content = if page_content.starts_with("<?xml") {
+            // 如果直接是XML内容，直接使用
+            page_content
+        } else {
+            // 否则尝试从HTML中提取RSS内容
+            log::info!("从HTML页面中提取RSS内容");
+            
+            // 查找pre标签中的内容，这通常包含RSS XML
+            let pre_content = if let Some(start) = page_content.find("<pre") {
+                if let Some(end_start) = page_content[start..].find(">").map(|i| start + i + 1) {
+                    if let Some(end) = page_content[end_start..].find("</pre>").map(|i| end_start + i) {
+                        page_content[end_start..end].to_string()
+                    } else {
+                        log::error!("未找到</pre>标签");
+                        return Err(RssError::NetworkError("从HTML中提取RSS内容失败: 未找到完整的pre标签".to_string()));
+                    }
+                } else {
+                    log::error!("未找到<pre>标签的结束符");
+                    return Err(RssError::NetworkError("从HTML中提取RSS内容失败: 未找到pre标签结束符".to_string()));
+                }
+            } else {
+                log::error!("未找到<pre>标签");
+                return Err(RssError::NetworkError("从HTML中提取RSS内容失败: 未找到pre标签".to_string()));
+            };
+            
+            log::info!("提取到pre标签内容，长度: {} bytes", pre_content.len());
+            log::info!("pre内容预览: {:?}", &pre_content[..std::cmp::min(pre_content.len(), 200)]);
+            
+            // 解码HTML实体，如&lt; -> <
+            let decoded_content = html_escape::decode_html_entities(&pre_content).to_string();
+            log::info!("解码后内容预览: {:?}", &decoded_content[..std::cmp::min(decoded_content.len(), 200)]);
+            
+            decoded_content
+        };
+
+        // 解析RSS内容
+        let channel = Channel::read_from(rss_content.as_bytes())
+            .map_err(|e| {
+                log::error!("解析RSS内容失败: {:?}", e);
+                RssError::ParseError(e)
+            })?;
+
+        // 转换为Article类型
+        Ok(self.parse_items_to_articles(&channel))
     }
 
     #[allow(unused)]

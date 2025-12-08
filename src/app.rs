@@ -4493,7 +4493,7 @@ impl eframe::App for App {
                                 let mut frame = egui::Frame::default();
                                 frame = frame.fill(ui.visuals().selection.bg_fill);
                                 frame = frame.stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
-                                frame = frame.inner_margin(egui::Margin::same(4)); // 使用整数而不是浮点数
+                                frame = frame.inner_margin(egui::Margin::same(1)); // 使用整数而不是浮点数
                                 
                                 frame.show(ui, |ui| {
                                     ui.selectable_label(true, title)
