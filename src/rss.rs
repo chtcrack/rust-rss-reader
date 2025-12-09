@@ -10,6 +10,7 @@ use reqwest::Url;
 use roxmltree::Document;
 use rss::{Channel, Item};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Instant;
@@ -530,9 +531,20 @@ impl RssFetcher {
     async fn fetch_feed_with_headless_chrome(&self, url: &str) -> Result<Vec<Article>, RssError> {
         log::info!("尝试使用Headless Chrome获取RSS源: {}", url);
         
-        // 构建浏览器启动选项
+        // 构建浏览器启动选项，使用非无头模式以避免403错误
+        // 并添加命令行参数，尽量隐藏浏览器窗口
         let launch_options = LaunchOptionsBuilder::default()
-            .headless(false)
+            .headless(false) // 禁用无头模式，因为很多网站会阻止无头浏览器
+            .window_size(Some((800, 600)))
+            // 添加命令行参数，将窗口定位到屏幕外
+            .args(vec![
+                OsStr::new("--window-position=-32000,-32000"), // 将窗口定位到屏幕外
+                OsStr::new("--no-startup-window"), // 不显示启动窗口
+                OsStr::new("--silent-launch"), // 静默启动
+                OsStr::new("--disable-extensions"), // 禁用扩展
+                OsStr::new("--disable-popup-blocking"), // 禁用弹窗阻止
+                OsStr::new("--disable-default-apps"), // 禁用默认应用
+            ])
             .build()
             .map_err(|e| {
                 log::error!("构建浏览器启动选项失败: {:?}", e);
