@@ -88,7 +88,7 @@ fn main() -> Result<(), eframe::Error> {
 
         // 启动应用程序
         eframe::run_native(
-            "Rust语言编写的RSS阅读器,代码编写->人工智能,设计思路->Chtcrack",
+            config::APP_WINDOW_TITLE,
             options,
             Box::new(move |cc| {
                 // 配置中文字体支持

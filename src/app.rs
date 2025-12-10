@@ -16,7 +16,7 @@ use web_view::*;
 // 导入自定义模块
 use crate::ai_client::{AIChatSession, AIClient};
 use crate::article_processor;
-use crate::config::{AppConfig, convert_to_configured_timezone};
+use crate::config::{AppConfig, convert_to_configured_timezone, APP_WINDOW_TITLE};
 use crate::feed_manager::FeedManager;
 use crate::models::{Article, Feed, FeedGroup};
 use crate::notification::NotificationManager;
@@ -788,6 +788,9 @@ pub struct App {
     // 窗口可见状态
     is_window_visible: bool,
     was_window_visible: bool, // 前一帧的窗口可见性状态，用于检测变化
+    
+    // 窗口句柄列表（在程序启动时获取）
+    window_handles: Vec<*mut std::ffi::c_void>,
 
     // 自动更新相关
     last_refresh_time: u64,     // 上次刷新时间（Unix时间戳）
@@ -801,6 +804,9 @@ pub struct App {
 
     // 系统托盘消息接收器
     tray_receiver: Option<Receiver<TrayMessage>>,
+    
+    // 托盘消息处理线程句柄
+    tray_thread_handle: Option<std::thread::JoinHandle<()>>,
 
     // UI更新消息通道
     ui_tx: Sender<UiMessage>,
@@ -1005,7 +1011,8 @@ impl App {
             tray_manager,
             tray_receiver,
             is_window_visible: true,
-            was_window_visible: true, // 初始状态与is_window_visible一致
+            was_window_visible: true, // 初始状态与is_window_visible一致,
+            window_handles: Vec::new(),
             ui_tx: ui_tx.clone(),
             ui_rx,
             is_importing: false,
@@ -1071,10 +1078,17 @@ impl App {
             is_translating: false,
             translated_article: None,
             show_translated_content: false,
+            
+            // 初始化托盘消息处理线程句柄
+            tray_thread_handle: None,
         };
 
         // 调用异步初始化函数，传递search_manager
         Self::initialize_data_async(storage, ui_tx, search_manager.clone());
+
+        // 启动托盘消息处理线程
+        let mut app = app;
+        app.start_tray_message_thread();
 
         app
     }
@@ -1174,6 +1188,124 @@ impl App {
         });
     }
 
+    /// 启动托盘消息处理线程
+    fn start_tray_message_thread(&mut self) {
+        // 如果没有托盘接收器，直接返回
+        let tray_receiver = self.tray_receiver.take();
+        if tray_receiver.is_none() {
+            return;
+        }
+        
+        // 启动新线程处理托盘消息
+        let thread_handle = std::thread::spawn(move || {
+            log::info!("托盘消息处理线程已启动");
+            
+            let receiver = tray_receiver.unwrap();
+            
+            // 持续处理托盘消息
+            loop {
+                match receiver.recv() {
+                    Ok(msg) => {
+                        log::info!("收到托盘消息: {:?}", msg);
+                        
+                        match msg {
+                            TrayMessage::ShowWindow => {
+                                log::info!("处理显示窗口命令");
+                                
+                                // 使用 Windows API 显示窗口
+                                unsafe {
+                                    use windows_sys::Win32::UI::WindowsAndMessaging::{ SW_SHOW, ShowWindow, FindWindowW, EnumWindows};
+                                    
+                                    // 定义显示窗口的回调函数
+                                    unsafe extern "system" fn enum_show_windows_callback(hwnd: *mut std::ffi::c_void, _lparam: isize) -> i32 {
+                                        // 显示找到的窗口
+                                        unsafe {
+                                            ShowWindow(hwnd, SW_SHOW);
+                                        }
+                                        log::info!("枚举到窗口并显示，HWND: {:?}", hwnd);
+                                        // 继续枚举所有窗口
+                                        1
+                                    }
+                                    
+                                    // 先尝试查找窗口
+                                    let window_title = APP_WINDOW_TITLE;
+                                    let mut title_utf16: Vec<u16> = window_title.encode_utf16().collect();
+                                    title_utf16.push(0);
+                                    
+                                    let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
+                                    if hwnd != std::ptr::null_mut() {
+                                        log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
+                                        ShowWindow(hwnd, SW_SHOW);
+                                    } else {
+                                        // 如果FindWindow失败，尝试枚举所有窗口
+                                        log::warn!("使用FindWindow未找到窗口，尝试枚举所有窗口");
+                                        let result = EnumWindows(
+                                            Some(enum_show_windows_callback),
+                                            0
+                                        );
+                                        log::info!("枚举窗口结果: {}", result);
+                                    }
+                                }
+                            },
+                            TrayMessage::HideWindow => {
+                                log::info!("处理隐藏窗口命令");
+                                
+                                // 使用 Windows API 隐藏窗口
+                                unsafe {
+                                    use windows_sys::Win32::UI::WindowsAndMessaging::{ SW_HIDE, ShowWindow, FindWindowW, EnumWindows};
+                                    
+                                    // 定义隐藏窗口的回调函数
+                                    unsafe extern "system" fn enum_hide_windows_callback(hwnd: *mut std::ffi::c_void, _lparam: isize) -> i32 {
+                                        // 隐藏找到的窗口
+                                        unsafe {
+                                            ShowWindow(hwnd, SW_HIDE);
+                                        }
+                                        log::info!("枚举到窗口并隐藏，HWND: {:?}", hwnd);
+                                        // 继续枚举所有窗口
+                                        1
+                                    }
+                                    
+                                    // 先尝试查找窗口
+                                    let window_title = APP_WINDOW_TITLE;
+                                    let mut title_utf16: Vec<u16> = window_title.encode_utf16().collect();
+                                    title_utf16.push(0);
+                                    
+                                    let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
+                                    if hwnd != std::ptr::null_mut() {
+                                        log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
+                                        ShowWindow(hwnd, SW_HIDE);
+                                    } else {
+                                        // 如果FindWindow失败，尝试枚举所有窗口
+                                        log::warn!("使用FindWindow未找到窗口，尝试枚举所有窗口");
+                                        let result = EnumWindows(
+                                            Some(enum_hide_windows_callback),
+                                            0
+                                        );
+                                        log::info!("枚举窗口结果: {}", result);
+                                    }
+                                }
+                            },
+                            TrayMessage::Exit => {
+                                log::info!("处理退出命令");
+                                // 退出程序
+                                std::process::exit(0);
+                            },
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("接收托盘消息失败: {}", e);
+                        break;
+                    },
+                }
+            }
+            
+            log::info!("托盘消息处理线程已退出");
+        });
+        
+        // 保存线程句柄
+        self.tray_thread_handle = Some(thread_handle);
+    }
+    
     /// 检查并处理窗口可见性变化
     /// 当窗口从不可见变为可见时，重新加载文章数据以确保用户看到最新内容
     fn check_and_handle_visibility_change(&mut self, ctx: &egui::Context) {
@@ -2463,36 +2595,39 @@ impl App {
     }
 }
 
+
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 检查并处理窗口可见性变化
-        self.check_and_handle_visibility_change(ctx);
-
-        // 处理系统托盘消息
-        if let Some(ref mut receiver) = self.tray_receiver {
-            while let Ok(msg) = receiver.try_recv() {
-                match msg {
-                    TrayMessage::ShowWindow => {
-                        log::info!("收到显示窗口命令");
-                        self.is_window_visible = true;
-                        ctx.request_repaint();
-                    }
-                    TrayMessage::HideWindow => {
-                        log::info!("收到隐藏窗口命令");
-                        self.is_window_visible = false;
-                        ctx.request_repaint();
-                    }
-                    TrayMessage::Exit => {
-                        // 退出前清理资源
-                        log::info!("程序即将退出，清理资源...");
-                        // 停止自动更新任务
-                        self.stop_auto_update();
-                        // 关闭应用
-                        std::process::exit(0);
-                    }
+        // 仅在首次运行时获取窗口句柄
+        if self.window_handles.is_empty() {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW;
+                
+                // 窗口标题
+                let window_title = APP_WINDOW_TITLE;
+                
+                // 将Rust字符串转换为UTF-16编码
+                let mut title_utf16: Vec<u16> = window_title.encode_utf16().collect();
+                title_utf16.push(0); // 添加终止符
+                
+                // 使用FindWindow查找指定标题的窗口
+                let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
+                
+                // 如果找到窗口句柄，保存到窗口句柄列表
+                if hwnd != std::ptr::null_mut() {
+                    log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
+                    self.window_handles.push(hwnd);
+                } else {
+                    log::warn!("未找到标题为\"{}\"的窗口", window_title);
                 }
             }
         }
+
+        // 检查并处理窗口可见性变化
+        self.check_and_handle_visibility_change(ctx);
+
+        // 托盘消息现在由独立线程处理
 
         // 添加调试信息显示
         egui::TopBottomPanel::bottom("debug_panel").show(ctx, |ui| {

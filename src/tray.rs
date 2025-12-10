@@ -73,8 +73,8 @@ fn create_tray_item(config: TrayIconConfig) -> Result<TrayItemLib, Box<dyn std::
             unsafe {
                 // 加载Windows默认应用图标
                 let hicon = LoadIconW(0 as HMODULE, IDI_APPLICATION);
-                if hicon != 0 {
-                    match TrayItemLib::new(&title, tray_item::IconSource::RawIcon(hicon)) {
+                if hicon != std::ptr::null_mut() {
+                    match TrayItemLib::new(&title, tray_item::IconSource::RawIcon(hicon as isize)) {
                         Ok(tray) => {
                             log::info!(
                                 "[DEBUG] Successfully created tray icon with RawIcon (Windows default icon)"

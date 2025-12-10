@@ -7,6 +7,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+/// 应用程序窗口标题
+pub const APP_WINDOW_TITLE: &str = "Rust语言编写的RSS阅读器,代码编写->人工智能,设计思路->Chtcrack";
+
 /// 将UTC时间转换为配置的时区时间并返回格式化的字符串
 pub fn convert_to_configured_timezone(utc_time: &DateTime<Utc>, timezone_str: &str) -> String {
     // 尝试解析时区字符串
