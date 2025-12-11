@@ -1184,7 +1184,7 @@ impl App {
                     Ok(())
                 })
                 .run()
-                .unwrap();
+                    .unwrap_or(());
         });
     }
 
@@ -1200,7 +1200,7 @@ impl App {
         let thread_handle = std::thread::spawn(move || {
             log::info!("托盘消息处理线程已启动");
             
-            let receiver = tray_receiver.unwrap();
+            let receiver = tray_receiver.unwrap_or_else(|| panic!("托盘接收器不可用，这是一个内部错误"));
             
             // 持续处理托盘消息
             loop {
@@ -3106,23 +3106,24 @@ impl eframe::App for App {
                         log::debug!("文章存在于当前列表中，直接选中");
                         self.selected_article_id = Some(article_id);
                         // 标记为已读
-                        let article = self
+                        if let Some(article) = self
                             .articles
                             .iter_mut()
                             .find(|a| a.id == article_id)
-                            .unwrap();
-                        if !article.is_read {
-                            article.is_read = true;
-                            // 发送文章状态更新消息
-                            let ui_tx = self.ui_tx.clone();
-                            let article_id_clone = article_id;
-                            tokio::spawn(async move {
-                                let _ = ui_tx.send(UiMessage::ArticleStatusUpdated(
-                                    article_id_clone,
-                                    true,
-                                    false,
-                                ));
-                            });
+                        {
+                            if !article.is_read {
+                                article.is_read = true;
+                                // 发送文章状态更新消息
+                                let ui_tx = self.ui_tx.clone();
+                                let article_id_clone = article_id;
+                                tokio::spawn(async move {
+                                    let _ = ui_tx.send(UiMessage::ArticleStatusUpdated(
+                                        article_id_clone,
+                                        true,
+                                        false,
+                                    ));
+                                });
+                            }
                         }
                     } else {
                         // 如果文章不存在于当前列表中，尝试重新加载所有文章
@@ -3191,7 +3192,7 @@ impl eframe::App for App {
             // 如果有订阅源但没有文章数据，立即添加示例文章
             let example_article = Article {
                 id: 1,
-                feed_id: self.selected_feed_id.unwrap(),
+                feed_id: self.selected_feed_id.unwrap_or(-1),
                 title: "测试文章标题 - 示例内容".to_string(),
                 content: "<h2>这是测试文章内容</h2><p>这是一段测试内容，用于验证文章显示功能。</p><p>如果您能看到这段文字，说明文章内容渲染正常。</p>".to_string(),
                 summary: "测试文章摘要内容".to_string(),
@@ -3820,7 +3821,7 @@ impl eframe::App for App {
 
                 // 显示所有订阅源
                 if self.cached_groups.contains_key(&""[..]) {
-                    for feed in self.cached_groups.get(&""[..]).unwrap() {
+                    for feed in self.cached_groups.get(&""[..]).unwrap_or(&Vec::new()) {
                         // 创建可选择的标签
                         let response = ui
                             .selectable_label(self.selected_feed_id == Some(feed.id), &feed.title);
@@ -4406,7 +4407,7 @@ impl eframe::App for App {
                     if !new_page_articles.is_empty() {
                         self.selected_article_id = Some(new_page_articles[0].id);
                         // 自动标记为已读
-                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
                             if !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
@@ -4424,7 +4425,7 @@ impl eframe::App for App {
                     if !next_page_articles.is_empty() {
                         self.selected_article_id = Some(next_page_articles[0].id);
                         // 自动标记为已读
-                        if let Some(article) = next_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                        if let Some(article) = next_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
                             if !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
@@ -4488,7 +4489,7 @@ impl eframe::App for App {
                     if !new_page_articles.is_empty() && new_index < new_page_articles.len() {
                         self.selected_article_id = Some(new_page_articles[new_index].id);
                         // 自动标记为已读
-                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap()) {
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
                             if !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
@@ -4737,7 +4738,7 @@ impl eframe::App for App {
                 if let Some(article) = self
                     .articles
                     .iter()
-                    .find(|a| a.id == self.selected_article_id.unwrap())
+                    .find(|a| a.id == self.selected_article_id.unwrap_or(-1))
                 {
                     // 文章标题
                     ui.heading(&article.title);
@@ -4798,17 +4799,18 @@ impl eframe::App for App {
                         } 
                         // 显示翻译后的内容
                         else if self.show_translated_content && self.translated_article.is_some() {
-                            let (translated_title, translated_content) = self.translated_article.as_ref().unwrap();
-                            // 显示翻译后的标题
-                            ui.heading(translated_title);
-                            ui.separator();
-                            // 渲染翻译后的内容
-                            Self::render_article_content_static(
-                                ui,
-                                translated_content,
-                                font_size,
-                                &article.link,
-                            );
+                            if let Some((translated_title, translated_content)) = self.translated_article.as_ref() {
+                                // 显示翻译后的标题
+                                ui.heading(translated_title);
+                                ui.separator();
+                                // 渲染翻译后的内容
+                                Self::render_article_content_static(
+                                    ui,
+                                    translated_content,
+                                    font_size,
+                                    &article.link,
+                                );
+                            }
                         } 
                         // 显示原始内容
                         else {

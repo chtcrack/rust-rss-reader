@@ -106,7 +106,10 @@ impl NotificationManager {
             match receiver.recv_timeout(QUEUE_CLEAN_INTERVAL) {
                 Ok(event) => match event {
                     NotificationEvent::NewArticles(feed_articles) => {
-                        let config = config.lock().unwrap();
+                        let config = match config.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue, // 无法获取锁，跳过本次通知
+                        };
                         if !config.enabled {
                             continue; // 通知已禁用
                         }
@@ -137,7 +140,10 @@ impl NotificationManager {
                     }
 
                     NotificationEvent::UpdateConfig(enabled, max_notifications, timeout_ms) => {
-                        let mut config = config.lock().unwrap();
+                        let mut config = match config.lock() {
+                            Ok(c) => c,
+                            Err(_) => continue, // 无法获取锁，跳过本次配置更新
+                        };
                         config.enabled = enabled;
                         config.max_notifications = max_notifications;
                         config.timeout_ms = timeout_ms;

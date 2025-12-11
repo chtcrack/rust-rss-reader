@@ -136,7 +136,7 @@ pub async fn search_articles(
     let results = if search_mode == "direct_search" && articles.is_some() {
         // 使用直接搜索
         let start_time = std::time::Instant::now();
-        let results = direct_search_articles(&query, articles.unwrap(), feed_id);
+        let results = direct_search_articles(&query, articles.unwrap_or(&[]), feed_id);
         let duration = start_time.elapsed();
         log::info!(
             "直接搜索完成，找到 {} 篇文章，耗时 {:?}ms",
