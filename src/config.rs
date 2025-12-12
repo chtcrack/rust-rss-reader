@@ -175,18 +175,21 @@ impl AppConfig {
             match CryptoManager::new() {
                 Ok(crypto_manager) => {
                     match crypto_manager.encrypt(&config_to_save.ai_api_key) {
-                        Ok(encrypted_key) => {
-                            config_to_save.ai_api_key = encrypted_key;
-                            config_to_save.ai_api_key_encrypted = true;
-                        },
-                        Err(e) => {
-                            log::error!("保存配置时加密API密钥失败: {:?}", e);
-                            // 加密失败，继续保存，但标记为未加密
-                        },
-                    }
+                    Ok(encrypted_key) => {
+                        config_to_save.ai_api_key = encrypted_key;
+                        config_to_save.ai_api_key_encrypted = true;
+                    },
+                    Err(e) => {
+                        log::error!("保存配置时加密API密钥失败: {:?}", e);
+                        // 加密失败，继续保存，但标记为未加密
+                        config_to_save.ai_api_key_encrypted = false;
+                    },
+                }
                 },
                 Err(e) => {
                     log::error!("创建加密管理器失败: {:?}", e);
+                    // 创建加密管理器失败，继续保存，但标记为未加密
+                    config_to_save.ai_api_key_encrypted = false;
                 },
             }
         }

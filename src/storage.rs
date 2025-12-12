@@ -19,7 +19,7 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
-    /// 清理HTML内容，只保留p标签内容以及回车换行符，移除所有其他HTML标签
+    /// 清理HTML内容，保留主要文本内容和基本结构
     pub fn sanitize_html(html: &str) -> String {
         // 首先检查输入是否为空
         if html.is_empty() {
@@ -31,18 +31,26 @@ impl StorageManager {
             // 创建ammonia构建器
             let mut builder = Builder::new();
             
-            // 只允许p标签
-            let allowed_tags = HashSet::from(["p"]);
+            // 允许更多常用标签
+            let allowed_tags = HashSet::from(["p", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6", 
+                                             "br", "hr", "ul", "ol", "li", "strong", "em", "b", "i",
+                                             "code", "pre", "blockquote"]);
             builder.tags(allowed_tags);
             
-            // 不允许任何属性
-            builder.tag_attributes(HashMap::new());
+            // 允许基本属性
+            let mut tag_attributes = HashMap::new();
+            // 允许所有标签的class属性（用于样式）
+            tag_attributes.insert("*", HashSet::from(["class"]));
+            // 允许链接和图片属性
+            tag_attributes.insert("a", HashSet::from(["href", "title"]));
+            tag_attributes.insert("img", HashSet::from(["src", "alt", "title"]));
+            builder.tag_attributes(tag_attributes);
             
-            // 不允许任何协议处理
+            // 设置URL相对路径处理
             builder.url_relative(UrlRelative::PassThrough);
             
-            // 不允许任何链接处理
-            builder.link_rel(None);
+            // 设置链接rel属性
+            builder.link_rel(Some("noopener noreferrer"));
             
             // 清理HTML内容
             let sanitized_html = builder.clean(html).to_string();
@@ -50,26 +58,93 @@ impl StorageManager {
             // 解码HTML实体
             let decoded = decode_html_entities(&sanitized_html);
             
-            // 使用正则表达式提取p标签内容，并保留每个p标签作为单独的段落
-            let re = regex::Regex::new(r"<p[^>]*>(.*?)</p>")
+            // 尝试提取所有文本内容，保留基本结构
+            // 首先使用更简单的方式处理，避免使用不支持的反向引用
+            let re = regex::Regex::new(r"<[^>]*>")
                 .expect("正则表达式创建失败");
             
-            let paragraphs: Vec<String> = re.captures_iter(&decoded)
-                .map(|cap| {
-                    let content = cap.get(1)
-                        .map(|m| m.as_str().trim())
-                        .unwrap_or("");
-                    content.to_string()
-                })
+            // 移除所有HTML标签，只保留文本内容
+            let simple_text = re.replace_all(&decoded, "").to_string();
+            
+            // 处理文本，将多个空格替换为一个，保留换行符
+            let mut result = String::new();
+            let mut last_char = ' ';
+            
+            for c in simple_text.chars() {
+                if c.is_whitespace() {
+                    if c == '\n' || c == '\r' {
+                        if last_char != '\n' {
+                            result.push('\n');
+                            last_char = '\n';
+                        }
+                    } else if !last_char.is_whitespace() {
+                        result.push(' ');
+                        last_char = ' ';
+                    }
+                } else {
+                    result.push(c);
+                    last_char = c;
+                }
+            }
+            
+            // 移除首尾空白
+            let trimmed = result.trim();
+            
+            // 将文本按段落分割
+            let paragraphs: Vec<String> = trimmed
+                .split_inclusive("\n\n")
+                .map(|s| s.trim().to_string())
                 .filter(|p| !p.is_empty())
                 .collect();
             
             // 使用回车换行符连接段落
             paragraphs.join("\n\n")
         }) {
-            Ok(cleaned_content) => cleaned_content,
+            Ok(cleaned_content) => {
+                // 如果主要逻辑返回空，使用备用处理方式
+                if cleaned_content.is_empty() {
+                    // 直接使用更简单的方式处理
+                    log::warn!("HTML清理主要逻辑返回空，使用备用处理方式");
+                    // 解码HTML实体
+                    let decoded = decode_html_entities(html).to_string();
+                    // 移除HTML标签
+                    let re = match regex::Regex::new(r"<[^>]*>") {
+                        Ok(re) => re,
+                        Err(_) => {
+                            // 如果正则表达式创建失败，直接返回解码后的内容
+                            return decoded;
+                        }
+                    };
+                    let simple_cleaned = re.replace_all(&decoded, "").to_string();
+                    // 处理换行符，将多个空格替换为一个，保留换行
+                    let mut result = String::new();
+                    let mut last_char = ' ';
+                    
+                    for c in simple_cleaned.chars() {
+                        if c.is_whitespace() {
+                            if c == '\n' || c == '\r' {
+                                if last_char != '\n' {
+                                    result.push('\n');
+                                    last_char = '\n';
+                                }
+                            } else if !last_char.is_whitespace() {
+                                result.push(' ');
+                                last_char = ' ';
+                            }
+                        } else {
+                            result.push(c);
+                            last_char = c;
+                        }
+                    }
+                    
+                    // 移除首尾空白
+                    result.trim().to_string()
+                } else {
+                    cleaned_content
+                }
+            },
             Err(_) => {
-                // 如果处理失败，尝试使用更简单的方式处理
+                // 如果处理失败，使用更简单的方式处理
                 log::warn!("HTML清理失败，使用简单处理方式");
                 // 解码HTML实体
                 let decoded = decode_html_entities(html).to_string();
