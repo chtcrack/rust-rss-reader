@@ -723,12 +723,26 @@ impl RssFetcher {
 
         let summary = self.get_summary(item);
 
+        // 获取作者信息，首先尝试标准author字段，然后尝试dc:creator扩展
+        let author = item.author()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                // 从Dublin Core扩展中获取dc:creator信息
+                item.dublin_core_ext()
+                    .and_then(|dc_ext| {
+                        dc_ext.creators()
+                            .first()
+                            .map(|c| c.to_string())
+                    })
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+
         Article {
             id: 0,      // 将由数据库自动生成
             feed_id: 0, // 将在添加到数据库时设置
             title: html_escape::decode_html_entities(item.title().unwrap_or("Untitled")).to_string(),
             link: item.link().unwrap_or("").to_string(),
-            author: item.author().unwrap_or("Unknown").to_string(),
+            author,
             pub_date,
             content,
             summary,
