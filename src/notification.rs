@@ -127,7 +127,7 @@ impl NotificationManager {
                                 ),
                                 &Self::truncate_text(&article.summary, 200),
                                 config.timeout_ms,
-                                article.clone(),
+                                article.id,
                                 ui_sender.clone(),
                             );
 
@@ -176,7 +176,7 @@ impl NotificationManager {
         let cutoff_time = Instant::now() - Duration::from_secs(60);
 
         // 移除所有过期的时间戳
-        while queue.front().map_or(false, |&time| time < cutoff_time) {
+        while queue.front().is_some_and(|&time| time < cutoff_time) {
             queue.pop_front();
         }
     }
@@ -186,7 +186,7 @@ impl NotificationManager {
         summary: &str,
         body: &str,
         timeout_ms: u64,
-        article: Article,
+        article_id: i64,
         _ui_sender: Option<Sender<UiMessage>>,
     ) {
         // 使用notify-rust发送通知
@@ -194,7 +194,7 @@ impl NotificationManager {
         info!("准备发送通知: {}", summary);
 
         // 将文章ID编码到动作标识符中
-        let view_action = format!("view_{}", article.id);
+        let view_action = format!("view_{}", article_id);
 
         // 创建通知实例并配置
         let result = Notification::new()
@@ -222,17 +222,14 @@ impl NotificationManager {
                     // 只有在非Windows平台上才支持wait_for_action
                     #[cfg(not(target_os = "windows"))]
                     {
-                        // 克隆必要的数据以在非Windows平台上使用
-                        let article_id = article.id;
-                        let ui_sender_clone = _ui_sender.clone();
-
                         // 在非Windows平台上，show()方法返回NotificationHandle
-                        if let Ok(handle) =
+                        if let Ok(handle) = 
                             <_ as std::convert::TryInto<notify_rust::NotificationHandle>>::try_into(
                                 _notification_handle,
                             )
                         {
-                            handle.wait_for_action(|action| {
+                            let ui_sender = _ui_sender.clone(); // 只在需要时clone一次
+                            handle.wait_for_action(move |action| {
                                 match action {
                                     // 处理查看按钮点击
                                     action if action.starts_with("view_") => {
@@ -242,8 +239,8 @@ impl NotificationManager {
                                                 info!("用户要查看文章 ID: {}", id);
 
                                                 // 通过UI消息发送器发送SelectArticle消息
-                                                if let Some(sender) = ui_sender_clone.as_ref() {
-                                                    if let Err(e) =
+                                                if let Some(sender) = ui_sender.as_ref() {
+                                                    if let Err(e) = 
                                                         sender.send(UiMessage::SelectArticle(id))
                                                     {
                                                         error!(

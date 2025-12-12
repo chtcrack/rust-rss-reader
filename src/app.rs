@@ -10,7 +10,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 // use image::DynamicImage;
-use anyhow;
 use web_view::*;
 
 // 导入自定义模块
@@ -83,23 +82,24 @@ async fn update_feed_internal(
     drop(storage_lock); // 提前释放storage锁
 
     // 如果启用了AI自动翻译，并且有AI客户端，则进行翻译
-    if let (Some(feed), Some(ai_client)) = (feed, ai_client) {
-        if feed.ai_auto_translate {
+    if let (Some(feed), Some(ai_client)) = (feed, ai_client)
+        && feed.ai_auto_translate {
             log::info!("开始为订阅源 {} 翻译文章", feed.title);
             
             // 先检查哪些文章已经存在于数据库中，避免重复翻译
             let storage = _storage.lock().await;
             let existing_articles = storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
-            let existing_guids: std::collections::HashSet<String> = existing_articles
+            // 优化：使用&str作为HashSet的键，避免不必要的clone操作
+            let existing_guids: std::collections::HashSet<&str> = existing_articles
                 .iter()
-                .map(|article| article.guid.clone())
+                .map(|article| &article.guid[..])
                 .collect();
             drop(storage); // 提前释放storage锁
             
             // 过滤出需要翻译的新文章
             let new_articles: Vec<_> = articles
                 .into_iter()
-                .filter(|article| !existing_guids.contains(&article.guid))
+                .filter(|article| !existing_guids.contains(&article.guid[..]))
                 .collect();
             
             log::info!("发现 {} 篇新文章需要翻译", new_articles.len());
@@ -108,7 +108,7 @@ async fn update_feed_internal(
             let translated_articles = tokio::spawn(async move {
                 let mut translated_articles = Vec::new();
                 
-                for article in new_articles {
+                for mut article in new_articles {
                     // 检测文章标题语言
                     let lang_result = ai_client.detect_language(&article.title).await;
                     
@@ -130,12 +130,11 @@ async fn update_feed_internal(
                                     Ok((translated_title, translated_content)) => {
                                         log::info!("文章翻译成功: {}", article.title);
                                         
-                                        // 创建翻译后的文章
-                                        let mut translated_article = article.clone();
-                                        translated_article.title = translated_title;
-                                        translated_article.content = translated_content;
-                                        
-                                        translated_articles.push(translated_article);
+                                        // 优化：直接修改article，避免不必要的clone操作
+                                        // 因为new_articles是独立线程的局部变量，直接修改不会影响其他线程
+                                        article.title = translated_title;
+                                        article.content = translated_content;
+                                        translated_articles.push(article);
                                     },
                                     Err(e) => {
                                         log::error!("文章翻译失败: {}, 错误: {:?}", article.title, e);
@@ -162,7 +161,6 @@ async fn update_feed_internal(
             // 使用翻译后的文章
             articles = translated_articles;
         }
-    }
 
     // 更新订阅源信息和添加文章
     let mut storage_lock = _storage.lock().await;
@@ -260,7 +258,7 @@ pub async fn perform_auto_update(
                     log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
 
                     // 按发布时间倒序排列，取最新的文章
-                    let mut sorted_articles = added_articles.clone();
+                    let mut sorted_articles = added_articles; // 直接使用，无需clone
                     sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
                     // 将所有新文章标题添加到通知列表
@@ -281,9 +279,9 @@ pub async fn perform_auto_update(
                         let search_mgr_clone = search_mgr.clone();
 
                         // 筛选出新增的文章（按发布时间倒序，取最新的new_count篇）
-                        let mut sorted_articles = new_articles.clone();
+                        let mut sorted_articles = new_articles; // 直接使用，无需clone
                         sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
-                        let added_articles: Vec<Article> =
+                        let added_articles: Vec<Article> = 
                             sorted_articles.into_iter().take(new_count).collect();
 
                         // 使用tokio::spawn异步更新搜索索引，避免阻塞主流程
@@ -333,6 +331,7 @@ pub async fn perform_auto_update(
 }
 
 /// 异步添加订阅源的辅助函数
+#[allow(clippy::too_many_arguments)]
 async fn add_feed_async(
     feed_url: String,
     feed_title: String,
@@ -359,7 +358,7 @@ async fn add_feed_async(
     // 创建新的订阅源
     let new_feed = Feed {
         id: -1,                    // 将由数据库自动生成
-        title: feed_title.clone(), // 使用clone避免所有权转移
+        title: feed_title.clone(), // 使用clone，因为后面还需要使用feed_title
         url: feed_url,
         group: feed_group,
         group_id: None,
@@ -375,15 +374,18 @@ async fn add_feed_async(
 
     // 保存订阅源到数据库
     let mut storage = _storage.lock().await;
-    let feed_id = storage.add_feed(new_feed.clone()).await?;
+    let feed_id = storage.add_feed(new_feed).await?;
 
     // 保存文章
     if !articles.is_empty() {
         let mut articles_to_save = articles;
         
+        // 获取AI自动翻译设置，避免再次访问new_feed
+
+        
         // 如果启用了AI自动翻译，对文章进行翻译
-        if new_feed.ai_auto_translate {
-            log::info!("开始为新添加的订阅源 {} 翻译文章", new_feed.title);
+        if ai_auto_translate {
+            log::info!("开始为新添加的订阅源 {} 翻译文章", feed_title);
             
             // 获取AI客户端
             let ai_client = AIClient::new(
@@ -394,11 +396,12 @@ async fn add_feed_async(
             
             if let Ok(ai_client) = ai_client {
                 // 使用独立线程执行翻译，避免阻塞主线程
-                let articles_clone = articles_to_save.clone();
+                // 优化：使用clone，因为后面还需要使用articles_to_save
+                let articles_to_translate = articles_to_save.clone();
                 let translated_articles = tokio::spawn(async move {
                     let mut translated_articles = Vec::new();
                     
-                    for article in articles_clone {
+                    for article in articles_to_translate {
                         // 检测文章标题语言
                         let lang_result = ai_client.detect_language(&article.title).await;
                         
@@ -420,8 +423,8 @@ async fn add_feed_async(
                                         Ok((translated_title, translated_content)) => {
                                             log::info!("文章翻译成功: {}", article.title);
                                             
-                                            // 创建翻译后的文章
-                                            let mut translated_article = article.clone();
+                                            // 直接修改文章，无需clone
+                                            let mut translated_article = article;
                                             translated_article.title = translated_title;
                                             translated_article.content = translated_content;
                                             
@@ -450,8 +453,8 @@ async fn add_feed_async(
                 }).await;
                 
                 // 使用翻译后的文章
-                if let Ok(translated_articles) = translated_articles {
-                    articles_to_save = translated_articles;
+                if let Ok(translated) = translated_articles {
+                    articles_to_save = translated;
                 }
             }
         }
@@ -608,7 +611,7 @@ async fn export_opml_async(
     let mut groups: std::collections::BTreeMap<String, Vec<&Feed>> = std::collections::BTreeMap::new();
     for feed in &feeds {
         let group_name = feed.group.clone();
-        groups.entry(group_name).or_insert_with(Vec::new).push(feed);
+        groups.entry(group_name).or_default().push(feed);
     }
 
     // 输出分组和订阅源
@@ -800,7 +803,7 @@ pub struct App {
     auto_update_handle: Option<tokio::task::JoinHandle<()>>, // 自动更新任务句柄
 
     // 系统托盘管理
-    tray_manager: Option<Arc<TrayManager>>,
+    tray_manager: Option<TrayManager>,
 
     // 系统托盘消息接收器
     tray_receiver: Option<Receiver<TrayMessage>>,
@@ -887,7 +890,7 @@ impl App {
     /// 使用系统托盘创建新的应用实例
     pub fn new_with_tray(
         cc: &eframe::CreationContext<'_>,
-        tray_manager: Arc<TrayManager>,
+        tray_manager: TrayManager,
         tray_receiver: Option<Receiver<TrayMessage>>,
     ) -> Self {
         Self::new_internal(cc, Some(tray_manager), tray_receiver)
@@ -896,7 +899,7 @@ impl App {
     /// 内部构造函数，用于共享初始化逻辑
     fn new_internal(
         cc: &eframe::CreationContext<'_>,
-        tray_manager: Option<Arc<TrayManager>>,
+        tray_manager: Option<TrayManager>,
         tray_receiver: Option<Receiver<TrayMessage>>,
     ) -> Self {
         // 加载配置
@@ -930,7 +933,7 @@ impl App {
 
         // 检测系统主题（注意：当前eframe版本中IntegrationInfo没有system_theme字段）
         let is_dark_mode = config.theme == "dark"
-            || (config.theme == "system" && egui::Visuals::dark().override_text_color.is_some()); // 使用简单默认值
+            || (config.theme == "system" && cc.egui_ctx.style().visuals.dark_mode); // 使用egui上下文获取系统实际主题
 
         // 应用主题设置
         cc.egui_ctx.set_visuals(if is_dark_mode {
@@ -1120,7 +1123,7 @@ impl App {
             .filter(|article| self.selected_articles.contains(&article.id))
             .collect();
 
-        for (_index, article) in selected_articles.iter().enumerate() {
+        for article in selected_articles.iter() {
             // preview.push_str(&format!("=== 文章 {} ===\n", index + 1));
 
             match self.ai_send_content_type {
@@ -1162,24 +1165,21 @@ impl App {
                 .debug(false)
                 .user_data(())
                 .invoke_handler(|webview, arg| {
-                    match arg {
-                        "inject_script" => {
-                            // 动态注入脚本
-                            let script = r#"
-                            // 错误处理
-                            window.console.error = function() {};
-                            window.onerror = function() { return true; };
-                            
-                            // 自定义函数
-                            window.customFunction = function() {
-                                console.log('Custom function injected at runtime');
-                            };
-                            
-                            customFunction(); // 立即执行
-                        "#;
-                            webview.eval(script)?;
-                        }
-                        _ => {}
+                    if arg == "inject_script" {
+                        // 动态注入脚本
+                        let script = r#"
+                        // 错误处理
+                        window.console.error = function() {};
+                        window.onerror = function() { return true; };
+                        
+                        // 自定义函数
+                        window.customFunction = function() {
+                            console.log('Custom function injected at runtime');
+                        };
+                        
+                        customFunction(); // 立即执行
+                    "#;
+                        webview.eval(script)?;
                     }
                     Ok(())
                 })
@@ -1233,7 +1233,7 @@ impl App {
                                     title_utf16.push(0);
                                     
                                     let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
-                                    if hwnd != std::ptr::null_mut() {
+                                    if !hwnd.is_null() {
                                         log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
                                         ShowWindow(hwnd, SW_SHOW);
                                     } else {
@@ -1271,7 +1271,7 @@ impl App {
                                     title_utf16.push(0);
                                     
                                     let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
-                                    if hwnd != std::ptr::null_mut() {
+                                    if !hwnd.is_null() {
                                         log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
                                         ShowWindow(hwnd, SW_HIDE);
                                     } else {
@@ -1331,11 +1331,10 @@ impl App {
                     };
 
                     // 将加载的文章发送到UI线程进行显示
-                    if let Ok(articles) = articles_result {
-                        if let Err(e) = ui_tx_clone.send(UiMessage::ArticlesLoaded(articles)) {
+                    if let Ok(articles) = articles_result
+                        && let Err(e) = ui_tx_clone.send(UiMessage::ArticlesLoaded(articles)) {
                             log::error!("发送文章加载消息失败: {}", e);
                         }
-                    }
                 });
             }
 
@@ -1664,18 +1663,16 @@ impl App {
             }
 
             // 尝试加载分组信息
-            if let Ok(groups) = storage_lock.get_all_groups().await {
-                if let Err(e) = ui_tx.send(UiMessage::GroupsLoaded(groups)) {
+            if let Ok(groups) = storage_lock.get_all_groups().await
+                && let Err(e) = ui_tx.send(UiMessage::GroupsLoaded(groups)) {
                     log::error!("发送分组消息失败: {}", e);
                 }
-            }
 
             // 尝试获取未读计数
-            if let Ok(count) = storage_lock.get_unread_count().await {
-                if let Err(e) = ui_tx.send(UiMessage::UnreadCountUpdated(count as i32)) {
+            if let Ok(count) = storage_lock.get_unread_count().await
+                && let Err(e) = ui_tx.send(UiMessage::UnreadCountUpdated(count as i32)) {
                     log::error!("发送未读计数失败: {}", e);
                 }
-            }
 
             // 确保总是发送初始化完成消息
             if let Err(e) = ui_tx.send(UiMessage::StatusMessage("初始化完成".to_string())) {
@@ -1762,20 +1759,44 @@ impl App {
 
     /// 执行搜索（用于防抖）
     fn execute_search(&mut self) {
+        // 始终更新搜索查询，确保与搜索输入保持一致
+        self.search_query = self.search_input.clone();
+        
         // 检查是否需要执行搜索
         if self.search_input.is_empty() {
-            // 空查询时清除搜索结果
-            self.search_query.clear();
+            // 空查询时退出搜索模式并重新加载文章
             self.search_results.clear();
             self.is_searching = false;
             self.is_search_mode = false;
             self.last_search_time = None;
             self.search_debounce_timer = None;
+            
+            // 根据当前选中的订阅源加载相应的文章
+            if let Some(feed_id) = self.selected_feed_id {
+                // 克隆storage的Arc引用，避免在非异步上下文中直接使用async方法
+                let storage_clone = Arc::clone(&self.storage);
+                let ui_tx_clone = self.ui_tx.clone();
+                
+                // 使用tokio::spawn在后台加载最新文章数据
+                tokio::spawn(async move {
+                    let storage_lock = storage_clone.lock().await;
+                    let articles_result = if feed_id == -1 {
+                        // 当选择全部文章时，获取所有文章
+                        storage_lock.get_all_articles().await
+                    } else {
+                        // 否则获取指定订阅源的文章
+                        storage_lock.get_articles_by_feed(feed_id).await
+                    };
+                    
+                    // 将加载的文章发送到UI线程进行显示
+                    if let Ok(articles) = articles_result
+                        && let Err(e) = ui_tx_clone.send(UiMessage::ArticlesLoaded(articles)) {
+                            log::error!("发送文章加载消息失败: {}", e);
+                        }
+                });
+            }
             return;
         }
-
-        // 更新搜索查询
-        self.search_query = self.search_input.clone();
 
         // 设置搜索状态为true
         self.is_searching = true;
@@ -1793,13 +1814,14 @@ impl App {
 
     /// 处理搜索防抖逻辑
     fn handle_search_debounce(&mut self, ctx: &egui::Context) {
-        // 只有当搜索输入发生变化时，才更新防抖定时器
-        if self.search_input != self.search_query {
+        // 检查搜索输入是否发生变化
+        let input_changed = self.search_input != self.search_query;
+        
+        // 如果输入发生变化，更新防抖定时器
+        if input_changed {
             self.search_debounce_timer = Some(std::time::Instant::now());
-            ctx.request_repaint_after(self.search_debounce_delay);
-            return;
         }
-
+        
         // 检查是否已经过了防抖延迟时间
         if let Some(instant) = self.search_debounce_timer {
             if instant.elapsed() >= self.search_debounce_delay {
@@ -1807,7 +1829,7 @@ impl App {
                 self.execute_search();
                 self.search_debounce_timer = None;
             } else {
-                // 继续等待，请求下一次重绘
+                // 请求在剩余延迟时间后重绘，以便再次检查
                 ctx.request_repaint_after(self.search_debounce_delay - instant.elapsed());
             }
         }
@@ -1927,13 +1949,11 @@ impl App {
                     tag_buffer.clear();
                     in_tag = false;
                 }
+            } else if c == '<' {
+                in_tag = true;
+                tag_buffer.push(c);
             } else {
-                if c == '<' {
-                    in_tag = true;
-                    tag_buffer.push(c);
-                } else {
-                    processed_text.push(c);
-                }
+                processed_text.push(c);
             }
         }
 
@@ -1985,29 +2005,27 @@ impl App {
                     tag_buffer.clear();
                     in_tag = false;
                 }
-            } else {
-                if c == '<' {
-                    // 保存缓冲区文本
-                    if !buffer.is_empty() {
-                        if in_list {
-                            // 列表项内的文本
-                            if let Some(last_item) = list_items.last_mut() {
-                                last_item.push_str(&buffer);
-                            }
-                        } else if in_quote {
-                            quote_text.push_str(&buffer);
-                        } else if in_code {
-                            code_text.push_str(&buffer);
-                        } else {
-                            parts.push(Part::Text(buffer.clone()));
+            } else if c == '<' {
+                // 保存缓冲区文本
+                if !buffer.is_empty() {
+                    if in_list {
+                        // 列表项内的文本
+                        if let Some(last_item) = list_items.last_mut() {
+                            last_item.push_str(&buffer);
                         }
-                        buffer.clear();
+                    } else if in_quote {
+                        quote_text.push_str(&buffer);
+                    } else if in_code {
+                        code_text.push_str(&buffer);
+                    } else {
+                        parts.push(Part::Text(buffer.clone()));
                     }
-                    in_tag = true;
-                    tag_buffer.push(c);
-                } else {
-                    buffer.push(c);
+                    buffer.clear();
                 }
+                in_tag = true;
+                tag_buffer.push(c);
+            } else {
+                buffer.push(c);
             }
         }
 
@@ -2031,6 +2049,7 @@ impl App {
     }
 
     /// 处理HTML标签，更新解析状态和部分列表
+    #[allow(clippy::too_many_arguments)]
     fn process_tag(
         tag: &str,
         parts: &mut Vec<Part>,
@@ -2083,13 +2102,11 @@ impl App {
 
         // 处理开始标签
         if tag_lower.starts_with("<h") {
-            if let Some(level) = tag_lower.chars().nth(2).and_then(|c| c.to_digit(10)) {
-                if level >= 1 && level <= 6 {
-                    if let Some(content) = Self::extract_tag_content(tag) {
+            if let Some(level) = tag_lower.chars().nth(2).and_then(|c| c.to_digit(10))
+                && (1..=6).contains(&level)
+                    && let Some(content) = Self::extract_tag_content(tag) {
                         parts.push(Part::Heading(level, content));
                     }
-                }
-            }
         } else if tag_lower.starts_with("<b") || tag_lower.starts_with("<strong") {
             if let Some(content) = Self::extract_tag_content(tag) {
                 parts.push(Part::Bold(content));
@@ -2099,13 +2116,12 @@ impl App {
                 parts.push(Part::Italic(content));
             }
         } else if tag_lower.starts_with("<a ") {
-            if let Some(link_text) = Self::extract_tag_content(tag) {
-                if let Some(url) = Self::extract_link_url(tag) {
+            if let Some(link_text) = Self::extract_tag_content(tag)
+                && let Some(url) = Self::extract_link_url(tag) {
                     // 将相对路径转换为绝对路径
                     let absolute_url = Self::resolve_url(url, base_url);
                     parts.push(Part::Link(link_text, absolute_url));
                 }
-            }
         } else if tag_lower.starts_with("<ul") {
             *in_list = true;
             *list_is_ordered = false;
@@ -2175,11 +2191,10 @@ impl App {
                     ui.add_space(4.0);
                 }
                 Part::Link(text, url) => {
-                    if ui.link(text).clicked() {
-                        if let Err(e) = open::that(url) {
+                    if ui.link(text).clicked()
+                        && let Err(e) = open::that(url) {
                             log::error!("Failed to open link: {}", e);
                         }
-                    }
                     ui.add_space(4.0);
                 }
                 Part::List(items, is_ordered) => {
@@ -2373,16 +2388,15 @@ impl App {
         }
 
         // 如果是协议相对URL，添加协议
-        if url.starts_with("//") {
-            if let Some(protocol_end) = base_url.find("://") {
+        if url.starts_with("//")
+            && let Some(protocol_end) = base_url.find("://") {
                 let protocol = &base_url[..protocol_end + 3];
                 return format!("{}{}", protocol, url);
             }
-        }
 
         // 如果是根相对URL，只保留base_url的协议和域名部分
-        if url.starts_with("/") {
-            if let Some(domain_end) = base_url.find("//") {
+        if url.starts_with("/")
+            && let Some(domain_end) = base_url.find("//") {
                 if let Some(path_start) = base_url[domain_end + 2..].find("/") {
                     let domain = &base_url[..domain_end + 2 + path_start];
                     return format!("{}{}", domain, url);
@@ -2391,7 +2405,6 @@ impl App {
                     return format!("{}{}", base_url, url);
                 }
             }
-        }
 
         // 如果是相对URL，保留base_url的目录部分
         if let Some(path_end) = base_url.rfind("/") {
@@ -2599,6 +2612,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        
         // 仅在首次运行时获取窗口句柄
         if self.window_handles.is_empty() {
             unsafe {
@@ -2615,13 +2629,25 @@ impl eframe::App for App {
                 let hwnd = FindWindowW(std::ptr::null(), title_utf16.as_ptr());
                 
                 // 如果找到窗口句柄，保存到窗口句柄列表
-                if hwnd != std::ptr::null_mut() {
+                if !hwnd.is_null() {
                     log::info!("使用FindWindow找到窗口，HWND: {:?}", hwnd);
                     self.window_handles.push(hwnd);
                 } else {
                     log::warn!("未找到标题为\"{}\"的窗口", window_title);
                 }
             }
+        }
+
+        // 确保主题设置一致，解决启动时主题显示异常问题
+        // 检查当前egui上下文的主题是否与应用配置一致
+        let current_visuals = ctx.style().visuals.dark_mode;
+        if current_visuals != self.is_dark_mode {
+            // 如果不一致，重新应用主题设置
+            ctx.set_visuals(if self.is_dark_mode {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
         }
 
         // 检查并处理窗口可见性变化
@@ -2653,11 +2679,7 @@ impl eframe::App for App {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
             let next_update_time = self.last_refresh_time + self.auto_update_interval * 60;
-            self.auto_update_countdown = if next_update_time > current_time {
-                next_update_time - current_time
-            } else {
-                0
-            };
+            self.auto_update_countdown = next_update_time.saturating_sub(current_time);
 
             // 只在需要显示倒计时时才请求每秒刷新一次，降低CPU占用
             if self.auto_update_countdown > 0 {
@@ -3062,12 +3084,11 @@ impl eframe::App for App {
                     self.articles = articles;
 
                     // 检查选中的文章是否仍在新的结果中，如果不在则清除选中状态
-                    if let Some(selected_id) = current_selected_id {
-                        if !self.articles.iter().any(|a| a.id == selected_id) {
+                    if let Some(selected_id) = current_selected_id
+                        && !self.articles.iter().any(|a| a.id == selected_id) {
                             self.selected_article_id = None;
                         }
                         // 如果在，则保持选中状态，不做任何操作
-                    }
 
                     // 请求UI重绘以显示搜索结果
                     ctx.request_repaint();
@@ -3110,8 +3131,7 @@ impl eframe::App for App {
                             .articles
                             .iter_mut()
                             .find(|a| a.id == article_id)
-                        {
-                            if !article.is_read {
+                            && !article.is_read {
                                 article.is_read = true;
                                 // 发送文章状态更新消息
                                 let ui_tx = self.ui_tx.clone();
@@ -3124,7 +3144,6 @@ impl eframe::App for App {
                                     ));
                                 });
                             }
-                        }
                     } else {
                         // 如果文章不存在于当前列表中，尝试重新加载所有文章
                         log::debug!("文章不存在于当前列表中，尝试重新加载所有文章");
@@ -3318,11 +3337,10 @@ impl eframe::App for App {
                                     Ok(feed_count) => {
                                         log::info!("OPML导入成功，共{}个订阅源", feed_count);
                                         // 重新加载订阅源列表
-                                        if let Ok(feeds) = storage.lock().await.get_all_feeds().await {
-                                            if let Err(e) = ui_tx.send(UiMessage::FeedsLoaded(feeds)) {
+                                        if let Ok(feeds) = storage.lock().await.get_all_feeds().await
+                                            && let Err(e) = ui_tx.send(UiMessage::FeedsLoaded(feeds)) {
                                                 log::error!("发送订阅源更新消息失败: {}", e);
                                             }
-                                        }
                                         if let Err(e) = ui_tx.send(UiMessage::StatusMessage(format!("OPML导入成功，共{}个订阅源", feed_count))) {
                                             log::error!("发送状态消息失败: {}", e);
                                         }
@@ -3437,7 +3455,7 @@ impl eframe::App for App {
                                                         log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
                                                         
                                                         // 按发布时间倒序排列，取最新的文章
-                                                        let mut sorted_articles = added_articles.clone();
+                                                        let mut sorted_articles = added_articles; // 直接使用，无需clone
                                                         sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
                                                         
                                                         // 将所有新文章标题添加到通知列表
@@ -3567,11 +3585,10 @@ impl eframe::App for App {
                     }
                     
                     // 系统托盘设置
-                    if ui.checkbox(&mut self.config.show_tray_icon, "启用系统托盘").changed() {
-                        if let Err(e) = self.config.save() {
+                    if ui.checkbox(&mut self.config.show_tray_icon, "启用系统托盘").changed()
+                        && let Err(e) = self.config.save() {
                             log::error!("Failed to save tray setting: {}", e);
                         }
-                    }
                     
                     // 控制台窗口设置（仅Windows）
                     #[cfg(target_os = "windows")]
@@ -3806,7 +3823,7 @@ impl eframe::App for App {
                     for feed in &self.feeds {
                         self.cached_groups
                             .entry(feed.group.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(feed.clone());
                     }
 
@@ -3820,8 +3837,8 @@ impl eframe::App for App {
                 }
 
                 // 显示所有订阅源
-                if self.cached_groups.contains_key(&""[..]) {
-                    for feed in self.cached_groups.get(&""[..]).unwrap_or(&Vec::new()) {
+                if self.cached_groups.contains_key("") {
+                    for feed in self.cached_groups.get("").unwrap_or(&Vec::new()) {
                         // 创建可选择的标签
                         let response = ui
                             .selectable_label(self.selected_feed_id == Some(feed.id), &feed.title);
@@ -4108,43 +4125,15 @@ impl eframe::App for App {
                 ui.label("搜索:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_input)
-                        .hint_text("输入关键字按回车搜索..")
+                        .hint_text("输入关键字按回城搜索..")
                         .desired_width(200.0)
                 );
                 
                 // 清除按钮
                 if !self.search_input.is_empty() && ui.button("清除").clicked() {
                     self.search_input.clear();
-                    self.search_query.clear();
-                    self.search_results.clear();
-                    self.is_searching = false;
-                    self.is_search_mode = false; // 退出搜索模式
-                    self.last_search_time = None;
-                    
-                    // 根据当前选中的订阅源加载相应的文章
-                    if let Some(feed_id) = self.selected_feed_id {
-                        if feed_id == -1 {
-                            // 如果选中的是全部订阅源，则加载所有文章
-                            if let Err(e) = self.ui_tx.send(UiMessage::SelectAllFeeds) {
-                                log::error!("发送SelectAllFeeds消息失败: {}", e);
-                            }
-                        } else {
-                            // 否则加载特定订阅源的文章
-                            let storage_clone = Arc::clone(&self.storage);
-                            let ui_tx_clone = self.ui_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = get_articles_by_feed_async(storage_clone, feed_id, ui_tx_clone).await {
-                                    log::error!("加载特定订阅源文章失败: {}", e);
-                                }
-                            });
-                        }
-                    } else {
-                        // 如果没有选中任何订阅源，则默认加载全部文章
-                        if let Err(e) = self.ui_tx.send(UiMessage::SelectAllFeeds) {
-                            log::error!("发送SelectAllFeeds消息失败: {}", e);
-                        }
-                    }
-                    ctx.request_repaint();
+                    // 立即执行搜索（会触发空搜索逻辑，重新加载文章）
+                    self.execute_search();
                 }
                 
                 // 显示搜索性能指标
@@ -4169,19 +4158,10 @@ impl eframe::App for App {
                 
                 // 按下回车时立即执行搜索，不等待防抖
                 if response.lost_focus() && ui.input_mut(|i| i.key_pressed(egui::Key::Enter)) {
-                    if !self.search_input.trim().is_empty() {
-                        // 立即执行搜索
-                        self.execute_search();
-                        // 取消防抖定时器，避免重复执行
-                        self.search_debounce_timer = None;
-                    } else {
-                        // 清空搜索
-                        self.search_results.clear();
-                        self.is_searching = false;
-                        self.last_search_time = None;
-                        // 取消防抖定时器
-                        self.search_debounce_timer = None;
-                    }
+                    // 立即执行搜索，无论是空还是非空输入
+                    self.execute_search();
+                    // 取消防抖定时器，避免重复执行
+                    self.search_debounce_timer = None;
                 }
                 
                 // 处理搜索防抖
@@ -4226,8 +4206,8 @@ impl eframe::App for App {
                 
                 ui.separator();
                 
-                if ui.button("刷新").clicked() {
-                    if let Some(feed_id) = self.selected_feed_id {
+                if ui.button("刷新").clicked()
+                    && let Some(feed_id) = self.selected_feed_id {
                         // 设置刷新标志
                         self.is_refreshing = true;
                         
@@ -4277,10 +4257,9 @@ impl eframe::App for App {
                             }
                         });
                     }
-                }
                 
-                if ui.button("全部已读").clicked() {
-                    if let Some(feed_id) = self.selected_feed_id {
+                if ui.button("全部已读").clicked()
+                    && let Some(feed_id) = self.selected_feed_id {
                         // 克隆必要的参数而不是整个App实例
                         let storage = self.storage.clone();
                         let ui_tx = self.ui_tx.clone();
@@ -4294,10 +4273,9 @@ impl eframe::App for App {
                             }
                         });
                     }
-                }
                 
-                if ui.button("全部删除").clicked() {
-                    if let Some(feed_id) = self.selected_feed_id {
+                if ui.button("全部删除").clicked()
+                    && let Some(feed_id) = self.selected_feed_id {
                         // 克隆必要的参数而不是整个App实例
                         let storage = self.storage.clone();
                         let search_manager = self.search_manager.clone();
@@ -4316,7 +4294,6 @@ impl eframe::App for App {
                             }
                         });
                     }
-                }
 
                 if ui.button("和AI聊天").clicked() {
                     // 显示AI对话窗口
@@ -4341,11 +4318,10 @@ impl eframe::App for App {
                         }
                     } else {
                         // 加载聊天历史记录
-                        if let Some(session) = self.ai_chat_session.as_mut() {
-                            if let Err(e) = session.load_chat_history() {
+                        if let Some(session) = self.ai_chat_session.as_mut()
+                            && let Err(e) = session.load_chat_history() {
                                 log::error!("加载聊天历史记录失败: {}", e);
                             }
-                        }
                     }
                 }
 
@@ -4375,7 +4351,7 @@ impl eframe::App for App {
             let total_pages = if total_articles == 0 {
                 1
             } else {
-                (total_articles + self.page_size - 1) / self.page_size
+                total_articles.div_ceil(self.page_size)
             };
             
             // 确保当前页码有效
@@ -4407,14 +4383,13 @@ impl eframe::App for App {
                     if !new_page_articles.is_empty() {
                         self.selected_article_id = Some(new_page_articles[0].id);
                         // 自动标记为已读
-                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
-                            if !article.is_read {
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1))
+                            && !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
                                 let ui_tx = self.ui_tx.clone();
                                 tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
                             }
-                        }
                     }
                 } else if input.key_pressed(egui::Key::ArrowRight) && self.current_page < total_pages {
                     self.current_page += 1;
@@ -4425,21 +4400,20 @@ impl eframe::App for App {
                     if !next_page_articles.is_empty() {
                         self.selected_article_id = Some(next_page_articles[0].id);
                         // 自动标记为已读
-                        if let Some(article) = next_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
-                            if !article.is_read {
+                        if let Some(article) = next_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1))
+                            && !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
                                 let ui_tx = self.ui_tx.clone();
                                 tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
                             }
-                        }
                     }
                 }
             }
             
             // 文章选择（上下方向键）
-            if has_articles && !current_page_articles.is_empty() {
-                if input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowDown) {
+            if has_articles && !current_page_articles.is_empty()
+                && (input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowDown)) {
                     // 找到当前选中文章在当前页的索引
                     let current_index = if let Some(selected_id) = self.selected_article_id {
                         current_page_articles.iter().position(|a| a.id == selected_id).unwrap_or(0)
@@ -4489,17 +4463,15 @@ impl eframe::App for App {
                     if !new_page_articles.is_empty() && new_index < new_page_articles.len() {
                         self.selected_article_id = Some(new_page_articles[new_index].id);
                         // 自动标记为已读
-                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1)) {
-                            if !article.is_read {
+                        if let Some(article) = new_page_articles.iter().find(|a| a.id == self.selected_article_id.unwrap_or(-1))
+                            && !article.is_read {
                                 let storage = self.storage.clone();
                                 let article_id = article.id;
                                 let ui_tx = self.ui_tx.clone();
                                 tokio::spawn(async move { if let Err(e) = mark_article_as_read_async(storage, article_id, ui_tx).await { log::error!("Failed to mark article as read: {}", e); } });
                             }
-                        }
                     }
                 }
-            }
             
             // 检查是否正在建立搜索索引
             if self.is_indexing {
@@ -4543,7 +4515,7 @@ impl eframe::App for App {
                             
                             tokio::spawn(async move {
                                 let mut storage = storage_clone.lock().await;
-                                if let Ok(_) = storage.mark_articles_as_read(&article_ids).await {
+                                if storage.mark_articles_as_read(&article_ids).await.is_ok() {
                                     let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量标记为已读".to_string()));
                                     let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
                                 }
@@ -4561,7 +4533,7 @@ impl eframe::App for App {
                             
                             tokio::spawn(async move {
                                 let mut storage = storage_clone.lock().await;
-                                if let Ok(_) = storage.delete_articles(&article_ids).await {
+                                if storage.delete_articles(&article_ids).await.is_ok() {
                                     let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量删除".to_string()));
                                     let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
                                 }
@@ -4869,11 +4841,10 @@ impl eframe::App for App {
                                 Self::spawn_webview(article.title.clone(), article.link.clone());
                             }
 
-                            if show_web_content && current_article_url == article_link {
-                                if ui.button("显示原始内容").clicked() {
+                            if show_web_content && current_article_url == article_link
+                                && ui.button("显示原始内容").clicked() {
                                     self.show_web_content = false;
                                 }
-                            }
 
                             if ui.button("删除文章").clicked() {
                                 let storage = self.storage.clone();
@@ -4927,11 +4898,10 @@ impl eframe::App for App {
                             }
 
                             // 翻译切换按钮
-                            if self.translated_article.is_some() {
-                                if ui.button(if self.show_translated_content { "显示原文" } else { "显示翻译" }).clicked() {
+                            if self.translated_article.is_some()
+                                && ui.button(if self.show_translated_content { "显示原文" } else { "显示翻译" }).clicked() {
                                     self.show_translated_content = !self.show_translated_content;
                                 }
-                            }
                         });
 
                         // 添加额外的底部空间，确保按钮不被紧贴底部
@@ -5193,11 +5163,10 @@ impl eframe::App for App {
                                 }
                             } else {
                                 // 加载聊天历史记录
-                                if let Some(session) = self.ai_chat_session.as_mut() {
-                                    if let Err(e) = session.load_chat_history() {
+                                if let Some(session) = self.ai_chat_session.as_mut()
+                                    && let Err(e) = session.load_chat_history() {
                                         log::error!("加载聊天历史记录失败: {}", e);
                                     }
-                                }
                             }
                             
                             // 发送内容到AI
@@ -5354,11 +5323,10 @@ impl eframe::App for App {
                 }
             } else {
                 // 加载聊天历史记录
-                if let Some(session) = self.ai_chat_session.as_mut() {
-                    if let Err(e) = session.load_chat_history() {
+                if let Some(session) = self.ai_chat_session.as_mut()
+                    && let Err(e) = session.load_chat_history() {
                         log::error!("加载聊天历史记录失败: {}", e);
                     }
-                }
             }
 
             egui::Window::new("AI对话")
@@ -5541,8 +5509,8 @@ impl eframe::App for App {
                                     self.ai_chat_input.clear();
                                 }
                             }
-                            if ui.button("清除历史").clicked() {
-                                if let Some(session) = &mut self.ai_chat_session {
+                            if ui.button("清除历史").clicked()
+                                && let Some(session) = &mut self.ai_chat_session {
                                     session.clear_history();
                                     self.status_message = "已清除对话历史".to_string();
                                     // 删除聊天历史记录文件
@@ -5550,7 +5518,6 @@ impl eframe::App for App {
                                         log::error!("删除聊天历史记录文件失败: {}", e);
                                     }
                                 }
-                            }
                             if ui.button("关闭").clicked() {
                                 self.show_ai_chat_window = false;
                             }
@@ -5640,7 +5607,7 @@ async fn refresh_single_feed_async(
             log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
 
             // 按发布时间倒序排列，取最新的文章
-            let mut sorted_articles = added_articles.clone();
+            let mut sorted_articles = added_articles; // 直接使用，无需clone
             sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
             // 将所有新文章标题添加到通知列表
@@ -5694,7 +5661,7 @@ async fn mark_all_as_read_async(
 
     // 发送消息更新UI状态
     let status_message = if let Some(_id) = feed_id {
-        format!("已将订阅源的所有文章标记为已读")
+        "已将订阅源的所有文章标记为已读".to_string()
     } else {
         "已将所有文章标记为已读".to_string()
     };
@@ -5800,8 +5767,8 @@ async fn get_articles_by_feed_async(
 }
 
 /// 获取所有文章的辅助函数
-
 /// 异步更新订阅源信息的辅助函数
+#[allow(clippy::too_many_arguments)]
 async fn update_feed_async(
     storage: Arc<Mutex<StorageManager>>,
     ui_tx: Sender<UiMessage>,
@@ -5870,12 +5837,12 @@ impl Drop for App {
         drop(self.ui_tx.clone());
 
         // 释放系统托盘资源（通过TrayManager的Drop实现自动清理）
-        if let Some(_tray_manager) = self.tray_manager.take() {
+        if self.tray_manager.take().is_some() {
             log::debug!("释放系统托盘管理器");
         }
 
         // 释放系统托盘消息接收器
-        if let Some(_) = self.tray_receiver.take() {
+        if self.tray_receiver.take().is_some() {
             log::debug!("释放系统托盘消息接收器");
         }
 

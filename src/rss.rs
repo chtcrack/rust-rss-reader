@@ -2,7 +2,6 @@
 
 use crate::models::Article;
 use chrono::{DateTime, Utc};
-use encoding_rs;
 use flate2::read::GzDecoder;
 use headless_chrome::{Browser, LaunchOptionsBuilder};
 use html2text::from_read;
@@ -17,6 +16,9 @@ use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+// 定义类型别名简化复杂类型
+type ArticleCache = Arc<Mutex<HashMap<String, (Instant, Vec<Article>)>>>;
 
 /// RSS错误类型
 #[derive(Error, Debug)]
@@ -51,7 +53,7 @@ pub struct RssFetcher {
     user_agent: String,
 
     /// 内存缓存
-    cache: Arc<Mutex<HashMap<String, (Instant, Vec<Article>)>>>,
+    cache: ArticleCache,
 
     cache_ttl: u64,
 }
@@ -144,7 +146,7 @@ impl RssFetcher {
 
                     // 指数退避重试
                     if attempt < max_retries - 1 {
-                        let delay_ms = 200 * (2_u64.pow(attempt as u32)) as u64;
+                        let delay_ms = 200 * (2_u64.pow(attempt as u32));
                         log::info!("Retrying after {}ms...", delay_ms);
                         sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -185,10 +187,10 @@ impl RssFetcher {
             // 只返回状态码和简短描述，不返回完整的错误响应内容
             // 对于403错误，特别处理，只显示状态码和简短描述
             let error_msg = match status.as_u16() {
-                403 => format!("HTTP 403 Forbidden - 服务器拒绝访问该网页"),
-                404 => format!("HTTP 404 Not Found - 网页不存在"),
-                500 => format!("HTTP 500 Internal Server Error - 服务器内部错误"),
-                503 => format!("HTTP 503 Service Unavailable - 服务器暂时不可用"),
+                403 => "HTTP 403 Forbidden - 服务器拒绝访问该网页".to_string(),
+                404 => "HTTP 404 Not Found - 网页不存在".to_string(),
+                500 => "HTTP 500 Internal Server Error - 服务器内部错误".to_string(),
+                503 => "HTTP 503 Service Unavailable - 服务器暂时不可用".to_string(),
                 _ => format!("HTTP {} - 请求失败", status),
             };
             return Err(RssError::NetworkError(error_msg));
@@ -215,7 +217,7 @@ impl RssFetcher {
         for attempt in 0..max_retries {
             match self.fetch_feed_once(url).await {
                 Ok(articles) => {
-                    // 缓存结果
+                    // 缓存结果（直接传递，避免clone）
                     self.add_to_cache(url, articles.clone()).await;
                     log::info!(
                         "Successfully fetched {} articles from {}",
@@ -236,7 +238,7 @@ impl RssFetcher {
 
                     // 指数退避重试
                     if attempt < max_retries - 1 {
-                        let delay_ms = 200 * (2_u64.pow(attempt as u32)) as u64;
+                        let delay_ms = 200 * (2_u64.pow(attempt as u32));
                         log::info!("Retrying after {}ms...", delay_ms);
                         sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -432,8 +434,7 @@ impl RssFetcher {
         let cleaned_text = text.replace("\u{FEFF}", "");
         // 尝试移除HTML标签
         let cleaned_text = regex::Regex::new(r"<[^>]*>")
-            .ok()
-            .and_then(|re| Some(re.replace_all(&cleaned_text, "").to_string()))
+            .ok().map(|re| re.replace_all(&cleaned_text, "").to_string())
             .unwrap_or(cleaned_text);
 
         match Channel::read_from(cleaned_text.as_bytes()) {
@@ -649,9 +650,8 @@ impl RssFetcher {
             let fetcher = self.clone();
             let url_str = url.to_string();
 
-            // 使用克隆来避免move和borrow冲突
-            let url_clone = url_str.clone();
-            let task = tokio::spawn(async move { (url_str, fetcher.fetch_feed(&url_clone).await) });
+            // 直接使用url_str，无需额外clone
+            let task = tokio::spawn(async move { (url_str.clone(), fetcher.fetch_feed(&url_str).await) });
 
             tasks.push(task);
         }
@@ -748,12 +748,11 @@ impl RssFetcher {
         }
 
         // 尝试解析没有逗号的GMT格式
-        if trimmed_date_str.contains("GMT") && !trimmed_date_str.contains(",") {
-            if let Ok(date) = DateTime::parse_from_str(trimmed_date_str, "%a %d %b %Y %H:%M:%S GMT")
+        if trimmed_date_str.contains("GMT") && !trimmed_date_str.contains(",")
+            && let Ok(date) = DateTime::parse_from_str(trimmed_date_str, "%a %d %b %Y %H:%M:%S GMT")
             {
                 return Ok(date.with_timezone(&Utc));
             }
-        }
 
         // 专门处理包含逗号的GMT格式，将GMT替换为+00:00再尝试解析
         if trimmed_date_str.contains(",") && trimmed_date_str.contains("GMT") {
@@ -812,14 +811,14 @@ impl RssFetcher {
         let decoded = html_escape::decode_html_entities(&plain_text);
         
         // 移除多余的空白字符，保留合理的换行和空格
-        let cleaned = decoded
+        
+        
+        decoded
             .lines()
             .map(|line| line.trim())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
-            .join("\n");
-        
-        cleaned
+            .join("\n")
     }
 
     /// 提取文章中的图片
@@ -848,11 +847,10 @@ impl RssFetcher {
             let favicon_url = format!("https://{}/favicon.ico", domain);
 
             // 检测favicon是否存在
-            if let Ok(response) = self.client.head(&favicon_url).send().await {
-                if response.status().is_success() {
+            if let Ok(response) = self.client.head(&favicon_url).send().await
+                && response.status().is_success() {
                     return Some(favicon_url);
                 }
-            }
         }
 
         None
@@ -947,20 +945,18 @@ impl RssFetcher {
         // 查找类似 <link rel="alternate" type="application/rss+xml" href="..."> 的标签
         if let Ok(pattern) = regex::Regex::new(
             r#"<link[^>]+rel=['"]alternate['"].*?type=['"]application/rss\+xml['"].*?href=['"]([^'"]+)['"]"#,
-        ) {
-            if let Some(caps) = pattern.captures(html) {
+        )
+            && let Some(caps) = pattern.captures(html) {
                 return Some(caps[1].to_string());
             }
-        }
 
         // 查找类似 <link rel="alternate" type="application/atom+xml" href="..."> 的标签
         if let Ok(pattern) = regex::Regex::new(
             r#"<link[^>]+rel=['"]alternate['"].*?type=['"]application/atom\+xml['"].*?href=['"]([^'"]+)['"]"#,
-        ) {
-            if let Some(caps) = pattern.captures(html) {
+        )
+            && let Some(caps) = pattern.captures(html) {
                 return Some(caps[1].to_string());
             }
-        }
 
         None
     }
@@ -970,17 +966,7 @@ impl RssFetcher {
         let mut result = Vec::new();
 
         // 检查是否有BOM
-        let is_be = if bytes.len() >= 2 {
-            if bytes[0] == 0xFE && bytes[1] == 0xFF {
-                true // UTF-16 BE with BOM
-            } else if bytes[0] == 0xFF && bytes[1] == 0xFE {
-                false // UTF-16 LE with BOM
-            } else {
-                false // 默认假设是LE
-            }
-        } else {
-            false
-        };
+        let is_be = bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF;
 
         // 跳过BOM
         let start_idx = if bytes.len() >= 2
@@ -1010,20 +996,17 @@ impl RssFetcher {
     #[allow(unused)]
     pub fn extract_link_url(&self, url: &str, base_url: &Option<String>) -> String {
         // 如果URL已经是完整的，则直接返回
-        if let Ok(parsed) = Url::parse(url) {
-            if parsed.scheme() != "" && parsed.domain().is_some() {
+        if let Ok(parsed) = Url::parse(url)
+            && parsed.scheme() != "" && parsed.domain().is_some() {
                 return url.to_string();
             }
-        }
 
         // 如果有基础URL，尝试构建完整URL
-        if let Some(base) = base_url {
-            if let Ok(base_parsed) = Url::parse(base) {
-                if let Ok(joined) = base_parsed.join(url) {
+        if let Some(base) = base_url
+            && let Ok(base_parsed) = Url::parse(base)
+                && let Ok(joined) = base_parsed.join(url) {
                     return joined.to_string();
                 }
-            }
-        }
 
         // 无法构建有效URL，返回原始值
         url.to_string()
@@ -1055,8 +1038,8 @@ impl RssFetcher {
             .filter(|n| n.tag_name().name() == "outline")
         {
             if let Some(type_attr) = outline.attribute("type") {
-                if type_attr == "rss" || type_attr == "atom" {
-                    if let (Some(title), Some(url)) = (
+                if (type_attr == "rss" || type_attr == "atom")
+                    && let (Some(title), Some(url)) = (
                         outline.attribute("title").or(outline.attribute("text")),
                         outline.attribute("xmlUrl"),
                     ) {
@@ -1077,9 +1060,8 @@ impl RssFetcher {
 
                         feeds.push((title.to_string(), url.to_string(), group));
                     }
-                }
-            } else if let Some(_) = outline.attribute("xmlUrl") {
-                if let (Some(title), Some(url)) = (
+            } else if outline.attribute("xmlUrl").is_some()
+                && let (Some(title), Some(url)) = (
                     outline.attribute("title").or(outline.attribute("text")),
                     outline.attribute("xmlUrl"),
                 ) {
@@ -1100,7 +1082,6 @@ impl RssFetcher {
 
                     feeds.push((title.to_string(), url.to_string(), group));
                 }
-            }
         }
 
         Ok(feeds)
@@ -1118,7 +1099,7 @@ impl RssFetcher {
         opml.push_str("<head>");
         opml.push_str("<title>Rust RSS Reader Subscriptions</title>");
         opml.push_str("<dateCreated>");
-        opml.push_str(&format!("{}", Utc::now().to_rfc3339()));
+        opml.push_str(&Utc::now().to_rfc3339().to_string());
         opml.push_str("</dateCreated>");
         opml.push_str("<ownerName>Rust RSS Reader</ownerName>");
         opml.push_str("</head>");
@@ -1133,7 +1114,7 @@ impl RssFetcher {
                 .push((title, url));
         }
 
-        if let Some(no_group_feeds) = groups.get(&""[..]) {
+        if let Some(no_group_feeds) = groups.get("") {
             for (title, url) in no_group_feeds {
                 opml.push_str(&format!(
                     "<outline type=\"rss\" title=\"{}\" text=\"{}\" xmlUrl=\"{}\"/>",
@@ -1187,26 +1168,24 @@ impl RssFetcher {
             .descendants()
             .filter(|n| n.tag_name().name() == "outline")
         {
-            if let Some(type_attr) = outline.attribute("type") {
-                if type_attr == "rss" || type_attr == "atom" {
-                    if let (Some(title), Some(url)) = (
-                        outline.attribute("title").or(outline.attribute("text")),
-                        outline.attribute("xmlUrl"),
-                    ) {
-                        // 获取层级分组名称
-                        let group = if let Some(parent) = outline.parent() {
-                            parent
-                                .attribute("title")
-                                .or(parent.attribute("text"))
-                                .unwrap_or("")
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
+            if let Some(type_attr) = outline.attribute("type")
+                && (type_attr == "rss" || type_attr == "atom")
+                && let (Some(title), Some(url)) = (
+                    outline.attribute("title").or(outline.attribute("text")),
+                    outline.attribute("xmlUrl"),
+                ) {
+                    // 获取层级分组名称
+                    let group = if let Some(parent) = outline.parent() {
+                        parent
+                            .attribute("title")
+                            .or(parent.attribute("text"))
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
 
-                        feeds.push((title.to_string(), url.to_string(), group));
-                    }
-                }
+                    feeds.push((title.to_string(), url.to_string(), group));
             }
         }
 
@@ -1274,11 +1253,11 @@ impl RssFetcher {
                         .find(|n| n.is_element() && n.tag_name().name() == "updated")
                 })
                 .and_then(|n| n.text())
-                .and_then(|text| match DateTime::parse_from_rfc3339(text.trim()) {
-                    Ok(dt) => Some(dt.with_timezone(&Utc)),
+                .map(|text| match DateTime::parse_from_rfc3339(text.trim()) {
+                    Ok(dt) => dt.with_timezone(&Utc),
                     Err(e) => {
                         log::warn!("解析日期失败: {}, 使用当前时间", e);
-                        Some(Utc::now())
+                        Utc::now()
                     }
                 })
                 .unwrap_or_else(Utc::now);
@@ -1433,26 +1412,24 @@ impl OpmlHandler {
             .descendants()
             .filter(|n| n.tag_name().name() == "outline")
         {
-            if let Some(type_attr) = outline.attribute("type") {
-                if type_attr == "rss" || type_attr == "atom" {
-                    if let (Some(title), Some(url)) = (
-                        outline.attribute("title").or(outline.attribute("text")),
-                        outline.attribute("xmlUrl"),
-                    ) {
-                        // 鑾峰彇鐖剁骇鍒嗙粍鍚嶇О
-                        let group = if let Some(parent) = outline.parent() {
-                            parent
-                                .attribute("title")
-                                .or(parent.attribute("text"))
-                                .unwrap_or("")
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
+            if let Some(type_attr) = outline.attribute("type")
+                && (type_attr == "rss" || type_attr == "atom")
+                && let (Some(title), Some(url)) = (
+                    outline.attribute("title").or(outline.attribute("text")),
+                    outline.attribute("xmlUrl"),
+                ) {
+                    // 鑾峰彇鐖剁骇鍒嗙粍鍚嶇О
+                    let group = if let Some(parent) = outline.parent() {
+                        parent
+                            .attribute("title")
+                            .or(parent.attribute("text"))
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
 
-                        feeds.push((title.to_string(), url.to_string(), group));
-                    }
-                }
+                    feeds.push((title.to_string(), url.to_string(), group));
             }
         }
 
@@ -1482,7 +1459,7 @@ impl OpmlHandler {
                 .push((title, url));
         }
 
-        if let Some(no_group_feeds) = groups.get(&""[..]) {
+        if let Some(no_group_feeds) = groups.get("") {
             for (title, url) in no_group_feeds {
                 opml.push_str(&format!(
                     "<outline type=\"rss\" title=\"{}\" xmlUrl=\"{}\"/>",

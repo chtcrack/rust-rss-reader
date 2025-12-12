@@ -90,10 +90,6 @@ impl PerFeedIndex {
     fn add_article(&mut self, article: Article) {
         let article_id = article.id;
 
-        // 保存文章
-        self.articles.insert(article_id, article.clone());
-        self.total_articles += 1;
-
         // 构建完整文本用于模糊匹配
         let full_text = format!(
             "{} {} {} {}",
@@ -102,8 +98,12 @@ impl PerFeedIndex {
         .to_lowercase();
         self.article_full_texts.insert(article_id, full_text);
 
-        // 更新索引
-        self.index_article(article);
+        // 更新索引（使用引用，避免克隆）
+        self.index_article(&article);
+
+        // 保存文章（最后克隆，避免重复操作）
+        self.articles.insert(article_id, article);
+        self.total_articles += 1;
     }
 
     /// 从索引中删除文章
@@ -118,7 +118,7 @@ impl PerFeedIndex {
         self.article_full_texts.remove(&article_id);
 
         // 从倒排索引中删除该文章的所有引用
-        for (_term, article_ids) in &mut self.inverted_index {
+        for article_ids in self.inverted_index.values_mut() {
             article_ids.remove(&article_id);
         }
 
@@ -228,7 +228,7 @@ impl PerFeedIndex {
     }
 
     /// 内部方法：将文章内容分词并添加到倒排索引
-    fn index_article(&mut self, article: Article) {
+    fn index_article(&mut self, article: &Article) {
         let article_id = article.id;
 
         // 合并所有需要索引的字段
@@ -245,7 +245,7 @@ impl PerFeedIndex {
         for term in terms {
             self.inverted_index
                 .entry(term)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(article_id);
         }
     }
@@ -592,7 +592,7 @@ impl SearchManager {
         let index = self.index.lock().await;
         let results = index.search(query, feed_id);
 
-        // 将结果保存到缓存
+        // 克隆一份结果返回，另一份用于缓存
         self.cache_results(&cache_key, results.clone()).await;
 
         results
@@ -614,13 +614,11 @@ impl SearchManager {
 
     /// 从缓存获取搜索结果
     async fn get_cached_results(&self, cache_key: &str) -> Option<Vec<Article>> {
-        if let Ok(cache) = self.search_cache.read() {
-            if let Some(entry) = cache.get(cache_key) {
-                if Instant::now().duration_since(entry.timestamp) <= self.cache_ttl {
+        if let Ok(cache) = self.search_cache.read()
+            && let Some(entry) = cache.get(cache_key)
+                && Instant::now().duration_since(entry.timestamp) <= self.cache_ttl {
                     return Some(entry.results.clone());
                 }
-            }
-        }
         None
     }
 
@@ -637,11 +635,10 @@ impl SearchManager {
 
             self.cleanup_expired_cache(&mut cache);
 
-            if cache.len() > 100 {
-                if let Some(oldest_key) = cache.keys().next().cloned() {
+            if cache.len() > 100
+                && let Some(oldest_key) = cache.keys().next().cloned() {
                     cache.remove(&oldest_key);
                 }
-            }
         }
     }
 

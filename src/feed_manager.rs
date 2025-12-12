@@ -186,7 +186,6 @@ impl FeedManager {
     }
 
     /// 重命名分组
-   
     pub async fn rename_group(&self, group_id: i64, new_name: &str) -> anyhow::Result<()> {
         let new_name_trimmed = new_name.trim();
         if new_name_trimmed.is_empty() {

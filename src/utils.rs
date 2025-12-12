@@ -45,11 +45,10 @@ pub fn format_datetime(dt: &DateTime<Utc>) -> String {
 /// 从URL获取域名
 #[allow(unused)]
 pub fn get_domain_from_url(url: &str) -> Option<String> {
-    if let Ok(uri) = Url::parse(url) {
-        if let Some(domain) = uri.domain() {
+    if let Ok(uri) = Url::parse(url)
+        && let Some(domain) = uri.domain() {
             return Some(domain.to_string());
         }
-    }
     None
 }
 
@@ -66,8 +65,8 @@ pub fn generate_unique_id() -> String {
 /// 获取应用数据目录
 #[allow(unused)]
 pub fn get_app_data_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        if let Some(mut path) = dirs::data_dir() {
+    if cfg!(target_os = "windows")
+        && let Some(mut path) = dirs::data_dir() {
             path.push("rust_rss_reader");
             // 确保目录存在
             if let Err(e) = std::fs::create_dir_all(&path) {
@@ -76,7 +75,6 @@ pub fn get_app_data_dir() -> PathBuf {
             }
             return path;
         }
-    }
 
     // 默认返回当前目录
     PathBuf::from(".")
@@ -85,8 +83,8 @@ pub fn get_app_data_dir() -> PathBuf {
 /// 获取缓存目录
 #[allow(unused)]
 pub fn get_cache_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        if let Some(mut path) = dirs::cache_dir() {
+    if cfg!(target_os = "windows")
+        && let Some(mut path) = dirs::cache_dir() {
             path.push("rust_rss_reader");
             // 确保目录存在
             if let Err(e) = std::fs::create_dir_all(&path) {
@@ -95,7 +93,6 @@ pub fn get_cache_dir() -> PathBuf {
             }
             return path;
         }
-    }
 
     // 默认返回当前目录
     PathBuf::from(".")

@@ -73,7 +73,7 @@ fn create_tray_item(config: TrayIconConfig) -> Result<TrayItemLib, Box<dyn std::
             unsafe {
                 // 加载Windows默认应用图标
                 let hicon = LoadIconW(0 as HMODULE, IDI_APPLICATION);
-                if hicon != std::ptr::null_mut() {
+                if !hicon.is_null() {
                     match TrayItemLib::new(&title, tray_item::IconSource::RawIcon(hicon as isize)) {
                         Ok(tray) => {
                             log::info!(
@@ -284,12 +284,9 @@ fn run_tray_thread(
                 // has_activity = true; // 暂时注释掉未使用的赋值
                 consecutive_idle_count = 0; // 重置空闲计数
 
-                match msg {
-                    TrayMessage::Exit => {
-                        log::info!("[DEBUG] Received exit message in tray thread");
-                        break Ok(());
-                    }
-                    _ => {}
+                if let TrayMessage::Exit = msg {
+                    log::info!("[DEBUG] Received exit message in tray thread");
+                    break Ok(());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -318,7 +315,7 @@ impl Clone for TrayManager {
         // 创建一个新的通道，但保留对原始功能的访问
         let (tx, _) = channel();
         Self {
-            tx: tx,
+            tx,
             rx: None,
             thread_handle: None,
             enabled: self.enabled,

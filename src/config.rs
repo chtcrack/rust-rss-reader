@@ -19,22 +19,22 @@ pub fn convert_to_configured_timezone(utc_time: &DateTime<Utc>, timezone_str: &s
         format!("{}", converted)
     } else if timezone_str == "Asia/Shanghai" {
         // Asia/Shanghai 特殊处理UTC+8时区
-        let converted = utc_time.clone() + chrono::Duration::hours(8);
+        let converted = *utc_time + chrono::Duration::hours(8);
         format!("{} (+08:00)", converted.format("%Y-%m-%d %H:%M:%S"))
     } else if timezone_str == "UTC" {
         // 如果是UTC时区，直接返回原始时间
         format!("{} (UTC)", utc_time.format("%Y-%m-%d %H:%M:%S"))
     } else if timezone_str == "Asia/Tokyo" {
         // 如果是Asia/Tokyo
-        let converted = utc_time.clone() + chrono::Duration::hours(9);
+        let converted = *utc_time + chrono::Duration::hours(9);
         format!("{} (+09:00)", converted.format("%Y-%m-%d %H:%M:%S"))
     } else if timezone_str == "America/New_York" {
         // 如果是America/New_York
-        let converted = utc_time.clone() + chrono::Duration::hours(-5);
+        let converted = *utc_time + chrono::Duration::hours(-5);
         format!("{} (-05:00)", converted.format("%Y-%m-%d %H:%M:%S"))
     } else {
         // 如果时区解析失败，返回UTC+8时间
-        let converted = utc_time.clone() + chrono::Duration::hours(8);
+        let converted = *utc_time + chrono::Duration::hours(8);
         format!("{} (+08:00)", converted.format("%Y-%m-%d %H:%M:%S"))
     }
 }
@@ -112,11 +112,7 @@ impl AppConfig {
 
     /// 创建默认配置
     pub fn default() -> Self {
-        let db_path = if cfg!(target_os = "windows") {
-            "./feeds.db".to_string()
-        } else {
-            "./feeds.db".to_string()
-        };
+        let db_path = "./feeds.db".to_string();
 
         Self {
             database_path: db_path,
@@ -149,11 +145,10 @@ impl AppConfig {
 
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(config) = serde_json::from_str(&contents) {
+            if file.read_to_string(&mut contents).is_ok()
+                && let Ok(config) = serde_json::from_str(&contents) {
                     return config;
                 }
-            }
         }
 
         // 如果加载失败，返回默认配置

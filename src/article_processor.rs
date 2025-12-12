@@ -1,6 +1,5 @@
 // 文章处理模块
 
-use anyhow;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use tokio::sync::Mutex;
@@ -14,17 +13,23 @@ use crate::storage::StorageManager;
 /// 比较旧文章和新文章，返回新增的文章列表
 pub fn get_new_articles(old_articles: &[Article], new_articles: &[Article]) -> Vec<Article> {
     // 创建旧文章GUID集合，用于快速查找
-    let old_guids: std::collections::HashSet<String> = old_articles
+    // 优化：使用HashSet<&str>而不是HashSet<String>，避免克隆GUID字符串
+    let old_guids: std::collections::HashSet<&str> = old_articles
         .iter()
-        .map(|article| article.guid.clone())
+        .map(|article| article.guid.as_str())
         .collect();
     
+    // 预分配结果空间，假设新增文章数量为新文章的20%
+    let mut results = Vec::with_capacity(new_articles.len() / 5);
+    
     // 过滤出新增的文章
-    new_articles
-        .iter()
-        .filter(|article| !old_guids.contains(&article.guid))
-        .cloned()
-        .collect()
+    for article in new_articles {
+        if !old_guids.contains(article.guid.as_str()) {
+            results.push(article.clone());
+        }
+    }
+    
+    results
 }
 
 /// 发送新文章通知的辅助函数
@@ -42,34 +47,33 @@ pub fn send_new_articles_notification(
     if let Some(notif_manager) = notification_manager.as_ref() {
         // 克隆必要的数据以在异步任务中使用
         let notif_manager_clone = notif_manager.clone();
-        let feed_title_clone = feed_title.to_string();
+        let feed_title_str = feed_title.to_string();
         let titles_clone = new_article_titles.to_vec();
 
         // 使用tokio::spawn异步发送通知，避免阻塞主流程
         tokio::spawn(async move {
-            // 创建文章对象列表
-            let feed_articles: Vec<(String, Article)> = titles_clone
-                .iter()
-                .map(|title| {
-                    (
-                        feed_title_clone.clone(),
-                        Article {
-                            id: 0,
-                            feed_id: 0,
-                            title: title.clone(),
-                            link: "".to_string(),
-                            author: "".to_string(),
-                            pub_date: chrono::Utc::now(),
-                            content: "".to_string(),
-                            summary: "".to_string(),
-                            is_read: false,
-                            is_starred: false,
-                            source: "".to_string(),
-                            guid: "".to_string(),
-                        },
-                    )
-                })
-                .collect();
+            // 创建文章对象列表 - 优化：使用Vec::with_capacity预分配空间
+            let mut feed_articles = Vec::with_capacity(titles_clone.len());
+            
+            for title in titles_clone.iter() {
+                feed_articles.push((
+                    feed_title_str.clone(), // 此处仍需克隆，因为每个元组需要独立所有权
+                    Article {
+                        id: 0,
+                        feed_id: 0,
+                        title: title.clone(),
+                        link: "".to_string(),
+                        author: "".to_string(),
+                        pub_date: chrono::Utc::now(),
+                        content: "".to_string(),
+                        summary: "".to_string(),
+                        is_read: false,
+                        is_starred: false,
+                        source: "".to_string(),
+                        guid: "".to_string(),
+                    },
+                ));
+            }
 
             notif_manager_clone
                 .lock()
@@ -88,7 +92,7 @@ pub fn direct_search_articles(query: &str, articles: &[Article], feed_id: i64) -
     }
 
     let query = query.trim().to_lowercase();
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(articles.len() / 2); // 预分配空间，假设平均匹配率为50%
 
     for article in articles {
         // 检查是否匹配订阅源ID
@@ -96,16 +100,29 @@ pub fn direct_search_articles(query: &str, articles: &[Article], feed_id: i64) -
             continue;
         }
 
-        // 检查文章是否包含搜索关键词
-        let article_text = format!(
-            "{} {} {} {}",
-            article.title.to_lowercase(),
-            article.content.to_lowercase(),
-            article.summary.to_lowercase(),
-            article.author.to_lowercase()
-        );
-
-        if article_text.contains(&query) {
+        // 优化：避免创建大字符串，分别检查各个字段
+        // 优先检查短字段，提高匹配效率
+        let title_lower = article.title.to_lowercase();
+        if title_lower.contains(&query) {
+            results.push(article.clone());
+            continue;
+        }
+        
+        let author_lower = article.author.to_lowercase();
+        if author_lower.contains(&query) {
+            results.push(article.clone());
+            continue;
+        }
+        
+        let summary_lower = article.summary.to_lowercase();
+        if summary_lower.contains(&query) {
+            results.push(article.clone());
+            continue;
+        }
+        
+        // 最后检查可能较大的content字段
+        let content_lower = article.content.to_lowercase();
+        if content_lower.contains(&query) {
             results.push(article.clone());
         }
     }

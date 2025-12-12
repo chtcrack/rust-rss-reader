@@ -51,26 +51,30 @@ impl StorageManager {
             let decoded = decode_html_entities(&sanitized_html);
             
             // 移除多余的空白字符，保留合理的换行和空格
-            let cleaned = decoded
+            
+            
+            decoded
                 .lines()
                 .map(|line| line.trim())
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>()
-                .join("\n");
-            
-            cleaned
+                .join("\n")
         }) {
             Ok(cleaned_content) => cleaned_content,
             Err(_) => {
                 // 如果处理失败，尝试使用更简单的方式处理
                 log::warn!("HTML清理失败，使用简单处理方式");
                 // 解码HTML实体
-                let decoded = decode_html_entities(html);
+                let decoded = decode_html_entities(html).to_string();
                 // 移除HTML标签
-                let simple_cleaned = regex::Regex::new(r"<[^>]*>")
-                    .unwrap_or_else(|_| regex::Regex::new(r"").unwrap())
-                    .replace_all(&decoded, "")
-                    .to_string();
+                let re = match regex::Regex::new(r"<[^>]*>") {
+                    Ok(re) => re,
+                    Err(_) => {
+                        // 如果正则表达式创建失败，直接返回解码后的内容
+                        return decoded;
+                    }
+                };
+                let simple_cleaned = re.replace_all(&decoded, "").to_string();
                 // 移除多余的空白字符
                 simple_cleaned
                     .lines()
@@ -91,11 +95,10 @@ impl StorageManager {
                 eprintln!("警告: 无法打开数据库 {:?}: {}", db_path, e);
                 eprintln!("尝试创建新的数据库文件...");
                 // 确保数据库目录存在
-                if let Some(parent) = PathBuf::from(&db_path).parent() {
-                    if let Err(create_err) = std::fs::create_dir_all(parent) {
+                if let Some(parent) = PathBuf::from(&db_path).parent()
+                    && let Err(create_err) = std::fs::create_dir_all(parent) {
                         eprintln!("错误: 无法创建数据库目录: {}", create_err);
                     }
-                }
                 // 再次尝试打开数据库
                 Connection::open(db_path).expect("创建数据库失败")
             }
@@ -244,7 +247,31 @@ impl StorageManager {
             "CREATE INDEX IF NOT EXISTS idx_articles_date ON articles(pub_date)",
             [],
         )?;
-        // 添加唯一索引，确保相同GUID的文章不会重复插入
+        // 处理重复的guid值，避免创建唯一索引时失败
+        // 1. 首先创建普通索引，不使用唯一约束
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_articles_guid_temp ON articles(guid)",
+            [],
+        )?;
+        
+        // 2. 清理表中重复的guid值，保留id最小的记录
+        conn.execute(
+            r#"DELETE FROM articles 
+               WHERE id NOT IN (
+                   SELECT MIN(id) FROM articles 
+                   GROUP BY guid 
+                   HAVING guid IS NOT NULL AND guid != ''
+               ) AND guid IS NOT NULL AND guid != ''"#,
+            [],
+        )?;
+        
+        // 3. 删除临时索引
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_articles_guid_temp",
+            [],
+        )?;
+        
+        // 4. 现在可以安全地创建唯一索引了
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_guid ON articles(guid)",
             [],
@@ -352,7 +379,6 @@ impl StorageManager {
     }
 
     /// 获取所有订阅源
-
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
         let conn = self.connection.lock().await;
 
@@ -396,7 +422,7 @@ impl StorageManager {
             let mut stmt = tx.prepare("SELECT DISTINCT group_name FROM feeds WHERE group_name != ''")?;
             stmt
                 .query_map([], |row| {
-                    Ok(row.get::<_, String>(0)?)
+                    row.get::<_, String>(0)
                 })?
                 .collect::<rusqlite::Result<Vec<String>>>()?
         };
@@ -432,7 +458,7 @@ impl StorageManager {
                 let group_id = tx.last_insert_rowid();
                 
                 // 添加到映射表
-                group_name_to_id.insert(group_name.clone(), group_id);
+                group_name_to_id.insert(group_name.to_string(), group_id); // 转换为String类型，无需clone
             }
         }
         
@@ -463,7 +489,6 @@ impl StorageManager {
     }
     
     /// 清理工作：移除feeds表中的group_name字段
-    
     pub async fn cleanup_group_name_field(&mut self) -> anyhow::Result<()> {
         let  conn = self.connection.lock().await;
         
@@ -485,7 +510,6 @@ impl StorageManager {
     }
 
     /// 更新订阅源信息
-
     pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
         let mut conn = self.connection.lock().await;
         
@@ -548,7 +572,6 @@ impl StorageManager {
     }
 
     /// 更新订阅源最后更新时间
-
     pub async fn update_feed_last_updated(&mut self, feed_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
@@ -561,7 +584,6 @@ impl StorageManager {
     }
 
     /// 删除订阅源
-
     pub async fn delete_feed(&mut self, feed_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
@@ -571,7 +593,6 @@ impl StorageManager {
     }
 
     /// 获取所有订阅源分组
-
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
         let conn = self.connection.lock().await;
 
@@ -726,7 +747,7 @@ impl StorageManager {
         const SETTING_KEY: &str = "update_interval_minutes";
 
         // 验证间隔值的合理性（1-1440分钟，即1分钟到1天）
-        if interval < 1 || interval > 1440 {
+        if !(1..=1440).contains(&interval) {
             anyhow::bail!("更新间隔必须在1-1440分钟之间");
         }
 
@@ -868,21 +889,27 @@ impl StorageManager {
         opml.push_str("<body>");
 
         // 按分组组织订阅源
-        let mut groups: std::collections::BTreeMap<String, Vec<&Feed>> =
-            std::collections::BTreeMap::new();
+        // 优化：使用&str作为键，避免不必要的clone操作
+        let mut groups: std::collections::HashMap<&str, Vec<&Feed>> = 
+            std::collections::HashMap::new();
 
         for feed in &feeds {
-            let group_name = feed.group.clone();
-            groups.entry(group_name).or_insert_with(Vec::new).push(feed);
+            // 直接使用feed.group的引用作为键，无需clone
+            let group_name = &feed.group[..];
+            groups.entry(group_name).or_default().push(feed);
         }
 
+        // 将分组转换为BTreeMap以保持排序
+        let mut sorted_groups: std::collections::BTreeMap<&str, Vec<&Feed>> = 
+            groups.into_iter().collect();
+
         // 输出分组和订阅源
-        for (group_name, feeds_in_group) in groups {
+        for (group_name, feeds_in_group) in sorted_groups {
             if group_name != "Uncategorized" {
                 opml.push_str(&format!(
                     "<outline text=\"{}\" title=\"{}\">\n",
-                    Self::escape_xml(&group_name),
-                    Self::escape_xml(&group_name)
+                    Self::escape_xml(group_name),
+                    Self::escape_xml(group_name)
                 ));
             }
 
@@ -1064,7 +1091,6 @@ impl StorageManager {
     }
 
     /// 添加文章
-
     pub async fn add_articles(
         &mut self,
         feed_id: i64,
@@ -1134,7 +1160,6 @@ impl StorageManager {
     }
 
     /// 获取指定订阅源的文章
-
     pub async fn get_articles_by_feed(&self, feed_id: i64) -> anyhow::Result<Vec<Article>> {
         let conn = self.connection.lock().await;
 
@@ -1269,7 +1294,6 @@ impl StorageManager {
     // delete_article方法已在文件上方定义
 
     /// 批量标记文章为已读
-
     pub async fn mark_all_as_read(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
@@ -1301,7 +1325,6 @@ impl StorageManager {
     }
 
     /// 删除单篇文章
-
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 

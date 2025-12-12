@@ -1,6 +1,5 @@
 // AI 客户端模块
 
-use dirs;
 use futures::StreamExt;
 use html_escape::decode_html_entities;
 use ammonia::{Builder, UrlRelative};
@@ -12,6 +11,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
 
+// 定义类型别名简化复杂类型
+type StreamCallback<'a> = Option<&'a mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>;
+
 /// AI 消息角色
 enum MessageRole {
     System,
@@ -19,12 +21,12 @@ enum MessageRole {
     Assistant,
 }
 
-impl ToString for MessageRole {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageRole::System => "system".to_string(),
-            MessageRole::User => "user".to_string(),
-            MessageRole::Assistant => "assistant".to_string(),
+            MessageRole::System => write!(f, "system"),
+            MessageRole::User => write!(f, "user"),
+            MessageRole::Assistant => write!(f, "assistant"),
         }
     }
 }
@@ -163,7 +165,7 @@ impl AIClient {
         messages: &[AIMessage],
         temperature: Option<f32>,
         max_tokens: Option<usize>,
-        stream_callback: Option<&mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>,
+        stream_callback: StreamCallback<'_>,
     ) -> Result<String, AIClientError> {
         // 检查 API Key
         if self.api_key.trim().is_empty() {
@@ -249,12 +251,12 @@ impl AIClient {
                 let line = current_line.drain(..=newline_pos).collect::<String>();
 
                 // 处理 SSE 格式的行
-                if line.starts_with("data: ") {
+                if let Some(stripped) = line.strip_prefix("data: ") {
                     // 提取数据部分
-                    let data = &line[6..].trim();
+                    let data = stripped.trim();
 
                     // 检查是否是结束标记
-                    if *data == "[DONE]" {
+                    if data == "[DONE]" {
                         break;
                     }
 
@@ -290,7 +292,7 @@ impl AIClient {
     pub async fn ask(
         &self,
         question: &str,
-        stream_callback: Option<&mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>,
+        stream_callback: StreamCallback<'_>,
     ) -> Result<String, AIClientError> {
         let messages = vec![
             AIMessage::system("你是一个有用的助手。请根据提供的内容，给出详细、准确的回答。"),
@@ -348,14 +350,14 @@ impl AIClient {
         let decoded = decode_html_entities(&sanitized_html);
         
         // 移除多余的空白字符，保留合理的换行和空格
-        let cleaned = decoded
+        
+        
+        decoded
             .lines()
             .map(|line| line.trim())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
-            .join("\n");
-        
-        cleaned
+            .join("\n")
     }
 
     /// 翻译文章标题和内容为中文
@@ -438,13 +440,12 @@ impl AIChatSession {
     /// 设置系统提示
     pub fn set_system_prompt(&mut self, prompt: &str) {
         // 检查是否已有系统消息
-        if let Some(first_message) = self.messages.first() {
-            if first_message.role == MessageRole::System.to_string() {
+        if let Some(first_message) = self.messages.first()
+            && first_message.role == MessageRole::System.to_string() {
                 // 更新现有系统消息
                 self.messages[0] = AIMessage::system(prompt);
                 return;
             }
-        }
 
         // 添加新的系统消息到开头
         self.messages.insert(0, AIMessage::system(prompt));
@@ -454,7 +455,7 @@ impl AIChatSession {
     pub async fn send_message(
         &mut self,
         content: &str,
-        stream_callback: Option<&mut (dyn FnMut(&str) -> Result<(), AIClientError> + Send)>,
+        stream_callback: StreamCallback<'_>,
     ) -> Result<String, AIClientError> {
         // 添加用户消息
         self.messages.push(AIMessage::user(content));
@@ -557,12 +558,11 @@ impl AIChatSession {
 
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(messages) = serde_json::from_str(&contents) {
+            if file.read_to_string(&mut contents).is_ok()
+                && let Ok(messages) = serde_json::from_str(&contents) {
                     self.messages = messages;
                     return Ok(());
                 }
-            }
         }
 
         Ok(())
@@ -637,7 +637,7 @@ fn estimate_ascii_word_tokens(&self, word_len: usize) -> usize {
         1..=3 => 1,  // 短单词通常1个token
         4..=7 => 2,  // 中等长度单词
         8..=11 => 3,
-        _ => (word_len + 3) / 4, // 长单词按平均估算
+        _ => word_len.div_ceil(4), // 长单词按平均估算
     }
 }
 
@@ -679,11 +679,10 @@ fn estimate_messages_tokens(&self, messages: &[AIMessage]) -> usize {
         if self.messages.len() > self.max_history_length {
             // 保留系统消息（如果有）
             let mut new_messages = Vec::new();
-            if let Some(first_message) = self.messages.first() {
-                if first_message.role == MessageRole::System.to_string() {
+            if let Some(first_message) = self.messages.first()
+                && first_message.role == MessageRole::System.to_string() {
                     new_messages.push(first_message.clone());
                 }
-            }
 
             // 保留最新的消息
             let start_index = self.messages.len() - (self.max_history_length - new_messages.len());

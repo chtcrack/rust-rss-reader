@@ -30,6 +30,7 @@ serde_json = "1.0.145"
 html2text = "0.16.4"
 html-escape = "0.2.13"
 flate2 = "1.0.28"  # 用于gzip解压
+base64 = "0.22.1"  # 用于base64编码解码
 encoding_rs = "0.8.35"  # 用于多种编码支持
 
 # 系统托盘和通知功能

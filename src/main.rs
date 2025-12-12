@@ -183,9 +183,8 @@ fn main() -> Result<(), eframe::Error> {
                     match std::panic::catch_unwind(|| {
                         // 初始化系统托盘
                         use crate::tray::TrayManager;
-                        use std::sync::Arc;
                         let (tray_manager, tray_receiver) = TrayManager::new(config.show_tray_icon);
-                        (Some(Arc::new(tray_manager)), tray_receiver)
+                        (Some(tray_manager), tray_receiver)
                     }) {
                         Ok((tray, receiver)) => {
                             log::info!("系统托盘初始化成功");
