@@ -19,8 +19,8 @@ pub struct StorageManager {
 }
 
 impl StorageManager {
-    /// 清理HTML内容，只保留p和br标签，移除所有其他HTML标签
-    fn sanitize_html(html: &str) -> String {
+    /// 清理HTML内容，只保留p标签内容以及回车换行符，移除所有其他HTML标签
+    pub fn sanitize_html(html: &str) -> String {
         // 首先检查输入是否为空
         if html.is_empty() {
             return String::new();
@@ -31,8 +31,8 @@ impl StorageManager {
             // 创建ammonia构建器
             let mut builder = Builder::new();
             
-            // 只允许p和br标签
-            let allowed_tags = HashSet::from(["p", "br"]);
+            // 只允许p标签
+            let allowed_tags = HashSet::from(["p"]);
             builder.tags(allowed_tags);
             
             // 不允许任何属性
@@ -50,15 +50,22 @@ impl StorageManager {
             // 解码HTML实体
             let decoded = decode_html_entities(&sanitized_html);
             
-            // 移除多余的空白字符，保留合理的换行和空格
+            // 使用正则表达式提取p标签内容，并保留每个p标签作为单独的段落
+            let re = regex::Regex::new(r"<p[^>]*>(.*?)</p>")
+                .expect("正则表达式创建失败");
             
+            let paragraphs: Vec<String> = re.captures_iter(&decoded)
+                .map(|cap| {
+                    let content = cap.get(1)
+                        .map(|m| m.as_str().trim())
+                        .unwrap_or("");
+                    content.to_string()
+                })
+                .filter(|p| !p.is_empty())
+                .collect();
             
-            decoded
-                .lines()
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
+            // 使用回车换行符连接段落
+            paragraphs.join("\n\n")
         }) {
             Ok(cleaned_content) => cleaned_content,
             Err(_) => {
@@ -75,13 +82,29 @@ impl StorageManager {
                     }
                 };
                 let simple_cleaned = re.replace_all(&decoded, "").to_string();
-                // 移除多余的空白字符
-                simple_cleaned
-                    .lines()
-                    .map(|line| line.trim())
-                    .filter(|line| !line.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                // 处理换行符，将多个空格替换为一个，保留换行
+                let mut result = String::new();
+                let mut last_char = ' ';
+                
+                for c in simple_cleaned.chars() {
+                    if c.is_whitespace() {
+                        if c == '\n' || c == '\r' {
+                            if last_char != '\n' {
+                                result.push('\n');
+                                last_char = '\n';
+                            }
+                        } else if !last_char.is_whitespace() {
+                            result.push(' ');
+                            last_char = ' ';
+                        }
+                    } else {
+                        result.push(c);
+                        last_char = c;
+                    }
+                }
+                
+                // 移除首尾空白
+                result.trim().to_string()
             }
         }
     }

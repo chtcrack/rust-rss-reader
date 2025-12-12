@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 // use image::DynamicImage;
-use web_view::*;
+
 
 // 导入自定义模块
 use crate::ai_client::{AIChatSession, AIClient};
@@ -388,10 +388,12 @@ async fn add_feed_async(
             log::info!("开始为新添加的订阅源 {} 翻译文章", feed_title);
             
             // 获取AI客户端
+            let config = crate::config::AppConfig::load_or_default();
+            let decrypted_api_key = config.get_decrypted_api_key().unwrap_or_default();
             let ai_client = AIClient::new(
-                &crate::config::AppConfig::load_or_default().ai_api_url,
-                &crate::config::AppConfig::load_or_default().ai_api_key,
-                &crate::config::AppConfig::load_or_default().ai_model_name,
+                &config.ai_api_url,
+                &decrypted_api_key,
+                &config.ai_model_name,
             );
             
             if let Ok(ai_client) = ai_client {
@@ -856,9 +858,7 @@ pub struct App {
     show_web_content: bool,
     current_article_url: String,
 
-    // WebView相关
-    #[allow(unused)]
-    webview_handle: Option<web_view::Handle<()>>,
+
 
     // 分页相关
     page_size: usize,    // 每页显示的文章数量
@@ -1033,12 +1033,16 @@ impl App {
             show_ai_chat_window: false,
             show_ai_settings_dialog: false,
             ai_chat_messages: Vec::new(),
-            ai_client: AIClient::new(
-                &config.ai_api_url,
-                &config.ai_api_key,
-                &config.ai_model_name,
-            )
-            .ok(),
+            ai_client: {
+                // 获取解密后的API密钥
+                let decrypted_api_key = config.get_decrypted_api_key().unwrap_or_default();
+                AIClient::new(
+                    &config.ai_api_url,
+                    &decrypted_api_key,
+                    &config.ai_model_name,
+                )
+                .ok()
+            },
             ai_chat_session: None,
 
             // AI流式相关状态
@@ -1051,7 +1055,7 @@ impl App {
 
             // AI设置窗口输入状态
             ai_settings_api_url: config.ai_api_url.clone(),
-            ai_settings_api_key: config.ai_api_key.clone(),
+            ai_settings_api_key: config.get_decrypted_api_key().unwrap_or_default(),
             ai_settings_model_name: config.ai_model_name.clone(),
 
             // 网页内容加载状态
@@ -1061,7 +1065,7 @@ impl App {
             current_article_url: String::new(),
 
             // WebView相关
-            webview_handle: None,
+
 
             page_size: 14,   // 默认每页显示50篇文章
             current_page: 1, // 当前页码从1开始
@@ -1153,40 +1157,7 @@ impl App {
         self.is_window_visible
     }
 
-    /// 生成并显示WebView窗口，用于加载完整网页内容
-    fn spawn_webview(title: String, url: String) {
-        // 在单独的线程中启动 webview
-        std::thread::spawn(move || {
-            web_view::builder()
-                .title(&title)
-                .content(Content::Url(&url))
-                .size(1024, 768)
-                .resizable(true)
-                .debug(false)
-                .user_data(())
-                .invoke_handler(|webview, arg| {
-                    if arg == "inject_script" {
-                        // 动态注入脚本
-                        let script = r#"
-                        // 错误处理
-                        window.console.error = function() {};
-                        window.onerror = function() { return true; };
-                        
-                        // 自定义函数
-                        window.customFunction = function() {
-                            console.log('Custom function injected at runtime');
-                        };
-                        
-                        customFunction(); // 立即执行
-                    "#;
-                        webview.eval(script)?;
-                    }
-                    Ok(())
-                })
-                .run()
-                    .unwrap_or(());
-        });
-    }
+
 
     /// 启动托盘消息处理线程
     fn start_tray_message_thread(&mut self) {
@@ -3305,8 +3276,9 @@ impl eframe::App for App {
         // 只支持从托盘发送消息到应用
         // 系统托盘的点击和菜单项操作已在tray.rs中处理
 
-        // 检查是否需要保存配置
-        self.config.save().ok();
+        // 移除每一帧保存配置的操作，因为所有配置修改都有明确的save()调用
+        // 频繁保存配置会导致性能问题和API密钥重复加密
+        // self.config.save().ok();
 
         // 设置窗口标题
         // 在新版本中，我们需要使用正确的API来设置窗口标题
@@ -3695,7 +3667,8 @@ impl eframe::App for App {
                     if ui.button("AI设置").clicked() {
                         // 将当前配置的值复制到AI设置窗口的输入字段
                         self.ai_settings_api_url = self.config.ai_api_url.clone();
-                        self.ai_settings_api_key = self.config.ai_api_key.clone();
+                        // 获取解密后的API密钥，以便用户在设置窗口中查看和编辑
+                        self.ai_settings_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
                         self.ai_settings_model_name = self.config.ai_model_name.clone();
                         
                         self.show_ai_settings_dialog = true;
@@ -4125,7 +4098,7 @@ impl eframe::App for App {
                 ui.label("搜索:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.search_input)
-                        .hint_text("输入关键字按回城搜索..")
+                        .hint_text("输入关键字按回车搜索..")
                         .desired_width(200.0)
                 );
                 
@@ -4837,8 +4810,43 @@ impl eframe::App for App {
                             }
 
                             if ui.button("加载网页内容").clicked() {
-                                // 使用WebView加载完整网页内容
-                                Self::spawn_webview(article.title.clone(), article.link.clone());
+                                // 使用Headless Chrome加载网页内容
+                                let article_link = article.link.clone();
+                                let _article_title = article.title.clone();
+                                let rss_fetcher = self.rss_fetcher.clone();
+                                let ui_tx = self.ui_tx.clone();
+                                
+                                self.is_loading_web_content = true;
+                                self.current_article_url = article_link.clone();
+                                
+                                tokio::spawn(async move {
+                                    log::info!("开始使用Headless Chrome加载网页内容: {}", article_link);
+                                    
+                                    // 使用Headless Chrome获取网页内容
+                                    match rss_fetcher.lock().await.fetch_web_content(&article_link).await {
+                                        Ok(html_content) => {
+                                            log::info!("成功获取网页内容，长度: {} bytes", html_content.len());
+                                            
+                                            // 清理HTML内容，只保留p标签和换行符
+                                            let cleaned_content = crate::storage::StorageManager::sanitize_html(&html_content);
+                                            
+                                            log::info!("HTML内容清理完成，清理后长度: {} bytes", cleaned_content.len());
+                                            
+                                            // 发送UI消息更新网页内容
+                                            if let Err(e) = ui_tx.send(UiMessage::WebContentLoaded(cleaned_content, article_link)) {
+                                                log::error!("发送UI消息失败: {}", e);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            log::error!("获取网页内容失败: {:?}", e);
+                                            // 发送错误消息
+                                            let error_msg = format!("获取网页内容失败: {:?}", e);
+                                            if let Err(e) = ui_tx.send(UiMessage::WebContentLoaded(error_msg, article_link)) {
+                                                log::error!("发送UI消息失败: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
                             }
 
                             if show_web_content && current_article_url == article_link
@@ -5275,30 +5283,63 @@ impl eframe::App for App {
 
                     ui.horizontal(|ui| {
                         if ui.button("保存").clicked() {
-                            // 更新配置
-                            self.config.ai_api_url = self.ai_settings_api_url.clone();
-                            self.config.ai_api_key = self.ai_settings_api_key.clone();
-                            self.config.ai_model_name = self.ai_settings_model_name.clone();
-
-                            // 保存配置到文件
-                            if let Err(e) = self.config.save() {
-                                log::error!("保存AI设置失败: {}", e);
-                                self.status_message = format!("保存AI设置失败: {}", e);
+                            // 获取当前解密后的API密钥
+                            let current_decrypted_key = self.config.get_decrypted_api_key().unwrap_or_default();
+                            
+                            // 比较输入的API密钥与当前解密后的密钥
+                            if self.ai_settings_api_key != current_decrypted_key {
+                                // API密钥发生了变化，更新并加密
+                                self.config.ai_api_url = self.ai_settings_api_url.clone();
+                                // 直接设置API密钥并标记为未加密，这样save()方法会自动加密
+                                self.config.ai_api_key = self.ai_settings_api_key.clone();
+                                self.config.ai_api_key_encrypted = false;
+                                self.config.ai_model_name = self.ai_settings_model_name.clone();
+                                
+                                // 保存配置到文件
+                                if let Err(e) = self.config.save() {
+                                    log::error!("保存AI设置失败: {}", e);
+                                    self.status_message = format!("保存AI设置失败: {}", e);
+                                } else {
+                                    // 重新初始化AI客户端，使用解密后的API密钥
+                                    let decrypted_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
+                                    self.ai_client = AIClient::new(
+                                        &self.ai_settings_api_url,
+                                        &decrypted_api_key,
+                                        &self.ai_settings_model_name,
+                                    )
+                                    .ok();
+                                    self.status_message = "AI设置已保存".to_string();
+                                }
                             } else {
-                                // 重新初始化AI客户端
-                                self.ai_client = AIClient::new(
-                                    &self.ai_settings_api_url,
-                                    &self.ai_settings_api_key,
-                                    &self.ai_settings_model_name,
-                                )
-                                .ok();
-                                self.status_message = "AI设置已保存".to_string();
+                                // API密钥没有变化，只更新URL和模型名称
+                                self.config.ai_api_url = self.ai_settings_api_url.clone();
+                                self.config.ai_model_name = self.ai_settings_model_name.clone();
+                                
+                                // 保存配置到文件
+                                if let Err(e) = self.config.save() {
+                                    log::error!("保存AI设置失败: {}", e);
+                                    self.status_message = format!("保存AI设置失败: {}", e);
+                                } else {
+                                    // 重新初始化AI客户端，使用解密后的API密钥
+                                    let decrypted_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
+                                    self.ai_client = AIClient::new(
+                                        &self.ai_settings_api_url,
+                                        &decrypted_api_key,
+                                        &self.ai_settings_model_name,
+                                    )
+                                    .ok();
+                                    self.status_message = "AI设置已保存".to_string();
+                                }
                             }
 
                             self.show_ai_settings_dialog = false;
                         }
 
                         if ui.button("取消").clicked() {
+                            // 取消时，恢复原有配置到输入框，显示解密后的API密钥
+                            self.ai_settings_api_url = self.config.ai_api_url.clone();
+                            self.ai_settings_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
+                            self.ai_settings_model_name = self.config.ai_model_name.clone();
                             self.show_ai_settings_dialog = false;
                         }
                     });

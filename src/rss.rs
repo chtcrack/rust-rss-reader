@@ -119,44 +119,7 @@ impl RssFetcher {
         articles
     }
 
-    /// 获取网页内容
-    #[allow(unused)]
-    pub async fn fetch_web_content(&self, url: &str) -> Result<String, RssError> {
-        log::info!("Fetching web content: {}", url);
 
-        // 重试机制
-        let max_retries = 3;
-        let mut last_error: Option<RssError> = None;
-
-        for attempt in 0..max_retries {
-            match self.fetch_web_content_once(url).await {
-                Ok(content) => {
-                    log::info!("Successfully fetched web content from {}", url);
-                    return Ok(content);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    log::warn!(
-                        "Attempt {}/{} failed for {}: {:?}",
-                        attempt + 1,
-                        max_retries,
-                        url,
-                        last_error
-                    );
-
-                    // 指数退避重试
-                    if attempt < max_retries - 1 {
-                        let delay_ms = 200 * (2_u64.pow(attempt as u32));
-                        log::info!("Retrying after {}ms...", delay_ms);
-                        sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
-            }
-        }
-
-        // 所有重试都失败
-        Err(last_error.unwrap_or(RssError::Unknown))
-    }
 
     /// 单次获取网页内容
     #[allow(unused)]
@@ -663,6 +626,72 @@ impl RssFetcher {
         }
 
         results
+    }
+    
+    /// 使用Headless Chrome获取网页内容
+    pub async fn fetch_web_content(&self, url: &str) -> Result<String, RssError> {
+        log::info!("尝试使用Headless Chrome获取网页内容: {}", url);
+        
+        // 构建浏览器启动选项，使用非无头模式以避免403错误
+        // 并添加命令行参数，尽量隐藏浏览器窗口
+        let launch_options = LaunchOptionsBuilder::default()
+            .headless(false) // 禁用无头模式，因为很多网站会阻止无头浏览器
+            .window_size(Some((800, 600)))
+            // 添加命令行参数，将窗口定位到屏幕外
+            .args(vec![
+                OsStr::new("--window-position=-32000,-32000"), // 将窗口定位到屏幕外
+                OsStr::new("--no-startup-window"), // 不显示启动窗口
+                OsStr::new("--silent-launch"), // 静默启动
+                OsStr::new("--disable-extensions"), // 禁用扩展
+                OsStr::new("--disable-popup-blocking"), // 禁用弹窗阻止
+                OsStr::new("--disable-default-apps"), // 禁用默认应用
+            ])
+            .build()
+            .map_err(|e| {
+                log::error!("构建浏览器启动选项失败: {:?}", e);
+                RssError::NetworkError(format!("Headless Chrome启动失败: {:?}", e))
+            })?;
+
+        // 启动浏览器
+        let browser = Browser::new(launch_options)
+            .map_err(|e| {
+                log::error!("启动Headless Chrome失败: {:?}", e);
+                RssError::NetworkError(format!("Headless Chrome启动失败: {:?}", e))
+            })?;
+
+        // 创建新标签页
+        let tab = browser.new_tab()
+            .map_err(|e| {
+                log::error!("创建新标签页失败: {:?}", e);
+                RssError::NetworkError(format!("创建标签页失败: {:?}", e))
+            })?;
+            
+
+        // 导航到URL
+        tab.navigate_to(url)
+            .map_err(|e| {
+                log::error!("导航到URL失败: {:?}", e);
+                RssError::NetworkError(format!("导航失败: {:?}", e))
+            })?;
+
+        // 等待页面加载完成
+        tab.wait_until_navigated()
+            .map_err(|e| {
+                log::error!("等待页面加载失败: {:?}", e);
+                RssError::NetworkError(format!("页面加载失败: {:?}", e))
+            })?;
+
+        // 获取页面内容
+        let page_content = tab.get_content()
+            .map_err(|e| {
+                log::error!("获取页面内容失败: {:?}", e);
+                RssError::NetworkError(format!("获取页面内容失败: {:?}", e))
+            })?;
+
+        log::info!("使用Headless Chrome获取到网页内容，长度: {} bytes", page_content.len());
+        log::info!("内容预览: {:?}", &page_content[..std::cmp::min(page_content.len(), 200)]);
+        
+        Ok(page_content)
     }
 
     /// 将RSS Item转换为Article类型

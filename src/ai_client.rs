@@ -172,6 +172,8 @@ impl AIClient {
             return Err(AIClientError::ConfigError("API Key 不能为空".to_string()));
         }
 
+    
+
         // 构建请求体
         let request = ChatCompletionRequest {
             model: self.model_name.clone(),

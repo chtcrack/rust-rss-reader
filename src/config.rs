@@ -7,6 +7,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+// 导入加密模块
+use crate::crypto::{CryptoManager, CryptoError};
+
 /// 应用程序窗口标题
 pub const APP_WINDOW_TITLE: &str = "Rust语言编写的RSS阅读器,代码编写->人工智能,设计思路->Chtcrack";
 
@@ -85,8 +88,11 @@ pub struct AppConfig {
     /// AI API URL地址
     pub ai_api_url: String,
 
-    /// AI API Key
+    /// AI API Key（加密存储）
     pub ai_api_key: String,
+
+    /// 标记AI API Key是否已加密
+    pub ai_api_key_encrypted: bool,
 
     /// AI 模型名称
     pub ai_model_name: String,
@@ -130,11 +136,12 @@ impl AppConfig {
             timezone: "UTC".to_string(), // 时区设置，默认为UTC
             // 默认显示控制台窗口，方便用户查看日志和调试信息
             show_console: true,
-            // 默认使用索引搜索
-            search_mode: "index_search".to_string(),
+            // 默认使用直接搜索
+            search_mode: "direct_search".to_string(),
             // AI配置默认值
             ai_api_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
             ai_api_key: "".to_string(),
+            ai_api_key_encrypted: false,
             ai_model_name: "Qwen/Qwen3-8B".to_string(),
         }
     }
@@ -158,11 +165,95 @@ impl AppConfig {
     /// 保存配置到文件
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = Self::config_path();
+        
+        // 创建一个临时配置，用于保存到文件
+        // 如果API密钥未加密，加密后再保存
+        let mut config_to_save = self.clone();
+        
+        // 只在API密钥不为空且未加密的情况下进行加密
+        if !config_to_save.ai_api_key.is_empty() && !config_to_save.ai_api_key_encrypted {
+            match CryptoManager::new() {
+                Ok(crypto_manager) => {
+                    match crypto_manager.encrypt(&config_to_save.ai_api_key) {
+                        Ok(encrypted_key) => {
+                            config_to_save.ai_api_key = encrypted_key;
+                            config_to_save.ai_api_key_encrypted = true;
+                        },
+                        Err(e) => {
+                            log::error!("保存配置时加密API密钥失败: {:?}", e);
+                            // 加密失败，继续保存，但标记为未加密
+                        },
+                    }
+                },
+                Err(e) => {
+                    log::error!("创建加密管理器失败: {:?}", e);
+                },
+            }
+        }
 
-        let json = serde_json::to_string_pretty(self)?;
+        let json = serde_json::to_string_pretty(&config_to_save)?;
         let mut file = File::create(path)?;
         file.write_all(json.as_bytes())?;
 
+        Ok(())
+    }
+    
+    /// 获取解密后的API密钥
+    pub fn get_decrypted_api_key(&self) -> Result<String, CryptoError> {
+        if self.ai_api_key.is_empty() {
+            return Ok("".to_string());
+        }
+        
+        // 创建加密管理器
+        let crypto_manager = CryptoManager::new()?;
+        
+        // 检查API密钥是否已加密，即使标记为未加密，也检查格式
+        let is_encrypted = self.ai_api_key_encrypted || crypto_manager.is_encrypted(&self.ai_api_key);
+        
+        if !is_encrypted {
+            return Ok(self.ai_api_key.clone());
+        }
+        
+        crypto_manager.decrypt(&self.ai_api_key)
+    }
+    
+    /// 设置API密钥（自动处理加密）
+    #[allow(dead_code)]
+    pub fn set_api_key(&mut self, api_key: &str) {
+        // 清除加密标记，因为我们设置的是明文
+        self.ai_api_key = api_key.to_string();
+        self.ai_api_key_encrypted = false;
+    }
+    
+    /// 加密API密钥（如果未加密）
+    #[allow(dead_code)]
+    pub fn encrypt_api_key(&mut self) -> Result<(), CryptoError> {
+        if self.ai_api_key.is_empty() || self.ai_api_key_encrypted {
+            return Ok(());
+        }
+        
+        let crypto_manager = CryptoManager::new()?;
+        let encrypted_key = crypto_manager.encrypt(&self.ai_api_key)?;
+        
+        self.ai_api_key = encrypted_key;
+        self.ai_api_key_encrypted = true;
+        
+        Ok(())
+    }
+    
+    /// 解密API密钥（如果已加密）
+    #[allow(dead_code)]
+    pub fn decrypt_api_key(&mut self) -> Result<(), CryptoError> {
+        if self.ai_api_key.is_empty() || !self.ai_api_key_encrypted {
+            return Ok(());
+        }
+        
+        let crypto_manager = CryptoManager::new()?;
+        let decrypted_key = crypto_manager.decrypt(&self.ai_api_key)?;
+        
+        self.ai_api_key = decrypted_key;
+        self.ai_api_key_encrypted = false;
+        
         Ok(())
     }
 }

@@ -33,6 +33,7 @@ mod ai_client;
 mod app;
 mod article_processor;
 mod config;
+mod crypto;
 mod feed_manager;
 mod models;
 mod notification;
