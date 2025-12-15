@@ -879,6 +879,12 @@ pub struct App {
     is_translating: bool,
     translated_article: Option<(String, String)>, // (translated_title, translated_content)
     show_translated_content: bool,
+    
+    // 文章编辑相关状态
+    is_editing_article: bool,
+    editing_article_id: Option<i64>,
+    editing_article_content: String,
+    
 }
 
 impl App {
@@ -1085,6 +1091,12 @@ impl App {
             is_translating: false,
             translated_article: None,
             show_translated_content: false,
+            
+            // 初始化文章编辑相关状态
+            is_editing_article: false,
+            editing_article_id: None,
+            editing_article_content: String::new(),
+            
             
             // 初始化托盘消息处理线程句柄
             tray_thread_handle: None,
@@ -4743,20 +4755,60 @@ impl eframe::App for App {
                             );
                         } 
                         // 显示翻译后的内容
-                        else if self.show_translated_content && self.translated_article.is_some() {
-                            if let Some((translated_title, translated_content)) = self.translated_article.as_ref() {
-                                // 显示翻译后的标题
-                                ui.heading(translated_title);
-                                ui.separator();
-                                // 渲染翻译后的内容
-                                Self::render_article_content_static(
-                                    ui,
-                                    translated_content,
-                                    font_size,
-                                    &article.link,
-                                );
-                            }
+                        else if self.show_translated_content && self.translated_article.is_some()
+                            && let Some((translated_title, translated_content)) = self.translated_article.as_ref() {
+                            // 显示翻译后的标题
+                            ui.heading(translated_title);
+                            ui.separator();
+                            // 渲染翻译后的内容
+                            Self::render_article_content_static(
+                                ui,
+                                translated_content,
+                                font_size,
+                                &article.link,
+                            );
                         } 
+                        // 编辑状态
+                        if self.is_editing_article && self.editing_article_id == Some(article.id) {
+                            // 显示可编辑的文本区域
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.editing_article_content)
+                                    .desired_width(f32::INFINITY)
+                            );
+                            
+                            // 保存和取消按钮
+                            ui.horizontal(|ui| {
+                                if ui.button("保存").clicked() {
+                                    // 保存编辑内容
+                                    let storage = self.storage.clone();
+                                    let article_id = article.id;
+                                    let new_content = self.editing_article_content.clone();
+                                    let ui_tx = self.ui_tx.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        let mut storage = storage.lock().await;
+                                        if let Err(e) = storage.update_article_content(article_id, &new_content).await {
+                                            log::error!("更新文章内容失败: {}", e);
+                                            let _ = ui_tx.send(UiMessage::Error(format!("更新文章内容失败: {}", e)));
+                                        } else {
+                                            let _ = ui_tx.send(UiMessage::StatusMessage("文章内容更新成功".to_string()));
+                                            let _ = ui_tx.send(UiMessage::ReloadArticles);
+                                        }
+                                    });
+                                    
+                                    // 退出编辑状态
+                                    self.is_editing_article = false;
+                                    self.editing_article_id = None;
+                                }
+                                
+                                if ui.button("取消").clicked() {
+                                    // 取消编辑，退出编辑状态
+                                    self.is_editing_article = false;
+                                    self.editing_article_id = None;
+                                    self.editing_article_content.clear();
+                                }
+                            });
+                        }
                         // 显示原始内容
                         else {
                             // 渲染基本的HTML内容
@@ -4903,6 +4955,27 @@ impl eframe::App for App {
                                         }
                                     });
                                 }
+                            }
+                            
+                            // 编辑文章按钮
+                            if ui.button("编辑").clicked() {
+                                // 进入编辑状态
+                                self.is_editing_article = true;
+                                self.editing_article_id = Some(article.id);
+                                
+                                // 根据当前显示的内容决定编辑的内容
+                                let content_to_edit = if show_web_content && current_article_url == article_link {
+                                    // 使用加载的网页内容
+                                    web_content.clone()
+                                } else if self.show_translated_content && self.translated_article.is_some() {
+                                    // 使用翻译后的内容
+                                    self.translated_article.as_ref().unwrap().1.clone()
+                                } else {
+                                    // 使用原始内容
+                                    article.content.clone()
+                                };
+                                
+                                self.editing_article_content = content_to_edit;
                             }
 
                             // 翻译切换按钮

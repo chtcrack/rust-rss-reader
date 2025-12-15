@@ -1322,6 +1322,22 @@ impl StorageManager {
         Ok(())
     }
 
+    /// 更新文章内容
+    pub async fn update_article_content(
+        &mut self,
+        article_id: i64,
+        new_content: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.connection.lock().await;
+
+        conn.execute(
+            "UPDATE articles SET content = ? WHERE id = ?",
+            params![new_content, article_id],
+        )?;
+
+        Ok(())
+    }
+
     /// 获取所有未读文章数量
     #[allow(unused)]
     pub async fn get_unread_count(&self) -> anyhow::Result<u32> {
@@ -1384,7 +1400,7 @@ impl StorageManager {
     pub async fn delete_feed_articles(&mut self, feed_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
-        conn.execute("DELETE FROM articles WHERE feed_id = ?", params![feed_id])?;
+        conn.execute("DELETE FROM articles WHERE feed_id = ? AND is_starred = 0", params![feed_id])?;
 
         Ok(())
     }
@@ -1426,7 +1442,7 @@ impl StorageManager {
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
 
-        conn.execute("DELETE FROM articles WHERE id = ?", params![article_id])?;
+        conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![article_id])?;
 
         Ok(())
     }
@@ -1437,10 +1453,10 @@ impl StorageManager {
 
         match feed_id {
             Some(id) => {
-                conn.execute("DELETE FROM articles WHERE feed_id = ?", params![id])?;
+                conn.execute("DELETE FROM articles WHERE feed_id = ? AND is_starred = 0", params![id])?;
             }
             None => {
-                conn.execute("DELETE FROM articles", [])?;
+                conn.execute("DELETE FROM articles WHERE is_starred = 0", [])?;
             }
         }
 
@@ -1451,7 +1467,7 @@ impl StorageManager {
     pub async fn delete_articles(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
         let conn = self.connection.lock().await;
         for &id in article_ids {
-            conn.execute("DELETE FROM articles WHERE id = ?", params![id])?;
+            conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![id])?;
         }
         Ok(())
     }
