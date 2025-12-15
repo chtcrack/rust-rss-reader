@@ -4799,6 +4799,7 @@ impl eframe::App for App {
                                     // 退出编辑状态
                                     self.is_editing_article = false;
                                     self.editing_article_id = None;
+                                    self.editing_article_content.clear();
                                 }
                                 
                                 if ui.button("取消").clicked() {

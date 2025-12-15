@@ -81,6 +81,7 @@ fn main() -> Result<(), eframe::Error> {
         // 设置应用程序配置
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
+                .with_title(config::APP_WINDOW_TITLE)
                 .with_inner_size([config.window_width as f32, config.window_height as f32])
                 .with_min_inner_size([800.0, 600.0]),
             ..Default::default()
@@ -89,7 +90,7 @@ fn main() -> Result<(), eframe::Error> {
 
         // 启动应用程序
         eframe::run_native(
-            config::APP_WINDOW_TITLE,
+            config::APP_NAME,
             options,
             Box::new(move |cc| {
                 // 配置中文字体支持

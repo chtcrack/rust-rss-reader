@@ -10,6 +10,9 @@ use std::path::PathBuf;
 // 导入加密模块
 use crate::crypto::{CryptoManager, CryptoError};
 
+/// 应用程序名称（用于数据存储路径）
+pub const APP_NAME: &str = "RustRssReader";
+
 /// 应用程序窗口标题
 pub const APP_WINDOW_TITLE: &str = "Rust语言编写的RSS阅读器,代码编写->人工智能,设计思路->Chtcrack";
 

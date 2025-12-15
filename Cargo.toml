@@ -1,19 +1,20 @@
 [package]
 name = "rust_rss_reader"
-version = "1.1.6"
+version = "1.1.9"
+rust-version = "1.92.0"
 description = "A lightweight and high-performance RSS reader for Windows 10"
 authors = ["chtcrack <chtcrack@gmail.com>"]
 edition = "2024"
 
 [dependencies]
 # GUI框架
-egui = "0.33.2"
-eframe = { version = "0.33.2", features = ["persistence", "default_fonts", "wgpu"] }
-egui_extras = { version = "0.33.2", features = ["http", "image"] }
-image = "0.25.1" # 用于图像处理和格式转换
+egui = "0.33.3"
+eframe = { version = "0.33.3", features = ["persistence", "default_fonts", "glow"] }
+egui_extras = { version = "0.33.3", features = ["http", "image"] }
+
 
 # HTTP客户端和异步运行时
-reqwest = { version = "0.12.24", features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12.25", features = ["json", "rustls-tls", "stream"] }
 tokio = { version = "1.48.0", features = ["full"] }
 regex = "1.12.2"
 
@@ -27,10 +28,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 
 # HTML处理
-html2text = "0.16.4"
+html2text = "0.16.5"
 html-escape = "0.2.13"
 flate2 = "1.0.28"  # 用于gzip解压
-base64 = "0.22.1"  # 用于base64编码解码
 encoding_rs = "0.8.35"  # 用于多种编码支持
 
 # 系统托盘和通知功能
@@ -41,25 +41,18 @@ notify-rust = { version = "4.11.7", optional = true }
 config = { version = "0.15.19", features = ["json"] }
 
 # 错误处理
-thiserror = "1.0.49"
+thiserror = "2.0.17"
 anyhow = "1.0.75"
 
 # 时间处理
 chrono = { version = "0.4.42", features = ["serde"] }
-chrono-tz = "0.8.0"  # 时区支持
-
-# 命令行参数
-clap = { version = "4.4.8", features = ["derive"] }
-
-# 全局静态变量
-lazy_static = "1.5.0"
+chrono-tz = "0.10.4"  # 时区支持
 
 # XML处理
 roxmltree = "0.21.1"
-quick-xml = "0.38.4"
 
 # 目录管理
-dirs = "5.0.1"
+dirs = "6.0.0"
 
 # 随机数生成
 rand = "0.9.2"
@@ -67,9 +60,6 @@ rand_core = "0.6.4"
 
 # 加密库
 aes-gcm = "0.10.3"
-pbkdf2 = "0.12.2"
-sha2 = "0.10.8"
-
 data-encoding = "2.5.0"
 
 # 日志
@@ -84,7 +74,7 @@ windows-sys = "0.61.2"
 open = "5.0.0"
 futures = "0.3.31"
 url = "2.5.7"
-rfd = "0.15.4"
+rfd = "0.16.0"
 ammonia = "4.1.2"
 headless_chrome = {git = "https://github.com/rust-headless-chrome/rust-headless-chrome", features = ["fetch"]}
 
