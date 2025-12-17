@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::app::UiMessage;
 use crate::models::Article;
@@ -123,7 +123,7 @@ pub fn direct_search_articles(query: &str, articles: &[Article], feed_id: i64) -
 /// 全局搜索文章函数 - 处理搜索请求并返回结果
 pub async fn search_articles(
     query: String,
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     search_manager: Arc<Mutex<SearchManager>>,
     ui_tx: Sender<UiMessage>,
     feed_id: i64,

@@ -88,6 +88,15 @@ pub struct AppConfig {
     /// 搜索方式设置 (index_search, direct_search)
     pub search_mode: String,
 
+    /// 是否启用自动清理旧文章
+    pub enable_auto_cleanup: bool,
+
+    /// 文章保留天数，超过此天数的文章将被自动清理
+    pub article_retention_days: u32,
+
+    /// 每个订阅源保留的最大文章数，超过此数量的旧文章将被自动清理
+    pub max_articles_per_feed: u32,
+
     /// AI API URL地址
     pub ai_api_url: String,
 
@@ -141,6 +150,10 @@ impl AppConfig {
             show_console: true,
             // 默认使用直接搜索
             search_mode: "direct_search".to_string(),
+            // 自动清理旧文章配置
+            enable_auto_cleanup: false,
+            article_retention_days: 60, // 默认保留30天
+            max_articles_per_feed: 1000, // 默认每个订阅源保留1000篇文章
             // AI配置默认值
             ai_api_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
             ai_api_key: "".to_string(),

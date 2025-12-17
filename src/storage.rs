@@ -7,13 +7,15 @@ use duckdb::types::ValueRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use ammonia::{Builder, UrlRelative};
 use html_escape::decode_html_entities;
 
 /// 存储管理器
 pub struct StorageManager {
-    /// 数据库路径
-    db_path: String,
+
+    /// 共享数据库连接
+    conn: Mutex<Connection>,
 }
 
 impl StorageManager {
@@ -190,8 +192,10 @@ impl StorageManager {
             eprintln!("错误: 无法创建数据库目录: {}", create_err);
         }
 
-        // 初始化数据库表
+        // 初始化数据库连接
         let conn = Connection::open(&db_path).expect("创建数据库连接失败");
+        
+        // 初始化数据库表
         match Self::init_database(&conn) {
             Ok(_) => (),
             Err(e) => {
@@ -205,17 +209,16 @@ impl StorageManager {
         // 移除VACUUM命令以避免资源死锁问题
 
         Self {
-            db_path,
+           
+            conn: Mutex::new(conn),
         }
     }
 
-    /// 获取新的数据库连接
-    fn get_connection(&self) -> Connection {
-        Connection::open(&self.db_path).expect("获取数据库连接失败")
-    }
+
 
     /// 初始化数据库表
     fn init_database(conn: &duckdb::Connection) -> DuckDBResult<()> {
+        conn.execute("PRAGMA encoding='UTF-8';", [])?;
         // 创建订阅源分组表的序列
         conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS feed_groups_id_seq START 1;",
@@ -250,9 +253,9 @@ impl StorageManager {
                 language TEXT,
                 link TEXT,
                 favicon TEXT,
-                auto_update INTEGER DEFAULT 1,
-                enable_notification INTEGER DEFAULT 1,
-                ai_auto_translate INTEGER DEFAULT 0
+                auto_update BOOLEAN DEFAULT TRUE,
+                enable_notification BOOLEAN DEFAULT TRUE,
+                ai_auto_translate BOOLEAN DEFAULT FALSE
             )"#,
             [],
         )?;
@@ -266,7 +269,7 @@ impl StorageManager {
         let has_auto_update = table_info.iter().any(|col| col == "auto_update");
         if !has_auto_update {
             conn.execute(
-                "ALTER TABLE feeds ADD COLUMN auto_update INTEGER DEFAULT 1",
+                "ALTER TABLE feeds ADD COLUMN auto_update BOOLEAN DEFAULT TRUE",
                 [],
             )?;
         }
@@ -275,7 +278,7 @@ impl StorageManager {
         let has_enable_notification = table_info.iter().any(|col| col == "enable_notification");
         if !has_enable_notification {
             conn.execute(
-                "ALTER TABLE feeds ADD COLUMN enable_notification INTEGER DEFAULT 1",
+                "ALTER TABLE feeds ADD COLUMN enable_notification BOOLEAN DEFAULT TRUE",
                 [],
             )?;
         }
@@ -284,7 +287,7 @@ impl StorageManager {
         let has_ai_auto_translate = table_info.iter().any(|col| col == "ai_auto_translate");
         if !has_ai_auto_translate {
             conn.execute(
-                "ALTER TABLE feeds ADD COLUMN ai_auto_translate INTEGER DEFAULT 0",
+                "ALTER TABLE feeds ADD COLUMN ai_auto_translate BOOLEAN DEFAULT TRUE",
                 [],
             )?;
         }
@@ -319,8 +322,8 @@ impl StorageManager {
                 pub_date TIMESTAMP NOT NULL,
                 content TEXT,
                 summary TEXT,
-                is_read INTEGER DEFAULT 0,
-                is_starred INTEGER DEFAULT 0,
+                is_read BOOLEAN DEFAULT FALSE,
+                is_starred BOOLEAN DEFAULT FALSE,
                 source TEXT,
                 guid TEXT
             )"#,
@@ -328,22 +331,25 @@ impl StorageManager {
         )?;
 
         // 创建索引以提高性能
+        // 优化：使用组合索引替代多个单字段索引，减少索引数量和维护开销
+        // 组合索引：feed_id + pub_date + is_read + is_starred，覆盖常用查询条件
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_articles_feed_id ON articles(feed_id)",
+            "CREATE INDEX IF NOT EXISTS idx_articles_feed_date_status ON articles(feed_id, pub_date DESC, is_read, is_starred)",
             [],
         )?;
+        
+        // 保留单独的is_starred索引，用于快速查询收藏文章
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_articles_read ON articles(is_read)",
+            "CREATE INDEX IF NOT EXISTS idx_articles_starred ON articles(is_starred, pub_date DESC)",
             [],
         )?;
+        
+        // 保留单独的is_read索引，用于快速查询未读文章
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_articles_starred ON articles(is_starred)",
+            "CREATE INDEX IF NOT EXISTS idx_articles_read ON articles(is_read, pub_date DESC)",
             [],
         )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_articles_date ON articles(pub_date)",
-            [],
-        )?;
+        
         // 处理重复的guid值，避免创建唯一索引时失败
         // 1. 首先创建普通索引，不使用唯一约束
         conn.execute(
@@ -373,9 +379,10 @@ impl StorageManager {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_guid ON articles(guid)",
             [],
         )?;
+        
         // 添加索引以提高重复检查的性能
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_articles_link_feed ON articles(link, feed_id)",
+            "CREATE INDEX IF NOT EXISTS idx_articles_link ON articles(link)",
             [],
         )?;
         
@@ -403,7 +410,7 @@ impl StorageManager {
         log::info!("开始添加订阅源，URL: {}", feed.url);
         
         // 获取数据库连接
-        let mut conn = self.get_connection();
+        let mut conn = self.conn.lock().unwrap();
         log::info!("获取数据库连接成功");
         
         // 开始事务，将所有操作放在一个事务中
@@ -485,9 +492,9 @@ impl StorageManager {
                 feed.language,
                 feed.link,
                 feed.favicon,
-                feed.auto_update as i8,
-                feed.enable_notification as i8,
-                feed.ai_auto_translate as i8
+                feed.auto_update,
+                feed.enable_notification,
+                feed.ai_auto_translate
             ],
             |row: &duckdb::Row| row.get::<_, i64>(0)
         )?;
@@ -503,10 +510,60 @@ impl StorageManager {
         Ok(id)
     }
 
+    /// 执行数据库VACUUM操作，清理过期数据版本，回收磁盘空间
+    #[allow(unused)]
+    pub async fn vacuum_database(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        // 执行VACUUM命令
+        conn.execute("VACUUM", [])?;
+        
+        Ok(())
+    }
+
+    /// 清理旧文章，根据配置删除超过保留天数或超过每个订阅源最大文章数的旧文章
+    #[allow(unused)]
+    pub async fn cleanup_old_articles(&self, retention_days: u32, max_articles_per_feed: u32) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        
+        // 计算清理日期
+        let cutoff_date = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+        
+        // 清理超过保留天数的文章，保留收藏的文章
+        let deleted_by_date = tx.execute(
+            "DELETE FROM articles WHERE pub_date < ? AND is_starred = 0",
+            params![cutoff_date]
+        )?;
+        
+        // 清理每个订阅源超过最大数量的旧文章，保留收藏的文章和未过期的文章
+        // 先获取每个订阅源需要保留的文章ID
+        let deleted_by_count = tx.execute(
+            r#"DELETE FROM articles 
+               WHERE id NOT IN (
+                   SELECT id FROM articles 
+                   WHERE is_starred = 1 OR pub_date >= ?
+               ) 
+               AND id NOT IN (
+                   SELECT id FROM (
+                       SELECT id, ROW_NUMBER() OVER (PARTITION BY feed_id ORDER BY pub_date DESC) as rn
+                       FROM articles 
+                       WHERE is_starred = 0 AND pub_date < ?
+                   ) t
+                   WHERE t.rn <= ?
+               )"#, 
+            params![cutoff_date, cutoff_date, max_articles_per_feed]
+        )?;
+        
+        tx.commit()?;
+        
+        Ok(deleted_by_date + deleted_by_count)
+    }
+
     /// 获取所有订阅源
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
         // 获取新的数据库连接
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         // 使用更简单的查询，避免复杂的JOIN和COALESCE
         // 直接获取订阅源和分组信息，DuckDB应该能正确处理
@@ -567,7 +624,7 @@ impl StorageManager {
 
     /// 更新订阅源信息
     pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         
         // 处理分组逻辑
         let group_id = if feed.group.is_empty() {
@@ -611,9 +668,9 @@ impl StorageManager {
                 feed.language,
                 feed.link,
                 feed.favicon,
-                feed.auto_update as i8,
-                feed.enable_notification as i8,
-                feed.ai_auto_translate as i8,
+                feed.auto_update,
+                feed.enable_notification,
+                feed.ai_auto_translate,
                 feed.id
             ],
         )?;
@@ -623,7 +680,7 @@ impl StorageManager {
 
     /// 更新订阅源最后更新时间
     pub async fn update_feed_last_updated(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
         let now = Utc::now();
@@ -637,7 +694,7 @@ impl StorageManager {
 
     /// 删除订阅源
     pub async fn delete_feed(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         // 先删除相关的文章
         conn.execute("DELETE FROM articles WHERE feed_id = ?", params![feed_id])?;
@@ -650,7 +707,7 @@ impl StorageManager {
 
     /// 获取所有订阅源分组
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
-          let conn = self.get_connection();
+          let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare("SELECT id, name, icon FROM feed_groups ORDER BY name")?;
 
@@ -670,7 +727,7 @@ impl StorageManager {
     /// 删除分组
     #[allow(unused)]
     pub async fn delete_group(&mut self, group_id: i64) -> anyhow::Result<()> {
-        let mut conn = self.get_connection();
+        let mut conn = self.conn.lock().unwrap();
 
         // 开始事务
         let tx = conn.transaction()?;
@@ -693,7 +750,7 @@ impl StorageManager {
     /// 添加分组
     #[allow(unused)]
     pub async fn add_group(&mut self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         // 验证分组名称不为空
         if group_name.trim().is_empty() {
@@ -742,7 +799,17 @@ impl StorageManager {
     ) -> anyhow::Result<()> {
         log::debug!("[update_group_name] 开始执行，group_id: {}, new_name: '{}'", group_id, new_name);
         
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
+        
+        // 检查新名称是否已被其他分组使用
+        let mut name_check_stmt = conn.prepare("SELECT id FROM feed_groups WHERE name = ? AND id != ?")?;
+        let name_exists = name_check_stmt
+            .query_row(params![new_name, group_id], |row| row.get::<_, i64>(0))
+            .optional()?;
+        
+        if name_exists.is_some() {
+            return Err(anyhow::anyhow!("分组名称 '{}' 已存在", new_name));
+        }
         
         // 更新订阅源的group_id
         conn.execute(
@@ -750,14 +817,13 @@ impl StorageManager {
             params![new_name, group_id],
         )?;
         
-        
         Ok(())
     }
     
     /// 通过group_id更新订阅源的分组信息
     #[allow(unused)]
     pub async fn update_feed_group(&mut self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         
         // 更新订阅源的group_id
         conn.execute(
@@ -771,7 +837,7 @@ impl StorageManager {
     /// 保存设置
     #[allow(unused)]
     pub async fn save_setting<T: Serialize>(&mut self, key: &str, value: &T) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         let json_value = serde_json::to_string(value)?;
 
         // 使用DuckDB原生的INSERT ON CONFLICT语法
@@ -789,7 +855,7 @@ impl StorageManager {
         &self,
         key: &str,
     ) -> anyhow::Result<Option<T>> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
         if let Ok(json_value) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
@@ -836,11 +902,11 @@ impl StorageManager {
     /// 获取所有收藏的文章
     #[allow(unused)]
     pub async fn get_starred_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
-             FROM articles WHERE is_starred = 1 ORDER BY pub_date DESC"
+             FROM articles WHERE is_starred = TRUE ORDER BY pub_date DESC"
         )?;
 
         let articles = stmt
@@ -861,8 +927,8 @@ impl StorageManager {
                     pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
-                    is_read: row.get::<_, i32>(8)? == 1,
-                    is_starred: row.get::<_, i32>(9)? == 1,
+                    is_read: row.get(8)?,
+                    is_starred: row.get(9)?,
                     source: row.get(10)?,
                     guid: row
                         .get::<_, String>(11)
@@ -877,7 +943,7 @@ impl StorageManager {
     /// 获取所有文章
     #[allow(unused)]
     pub async fn get_all_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -922,8 +988,8 @@ impl StorageManager {
                     pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
-                    is_read: row.get::<_, i32>(8)? == 1,
-                    is_starred: row.get::<_, i32>(9)? == 1,
+                    is_read: row.get(8)?,
+                    is_starred: row.get(9)?,
                     source: row.get(10)?,
                     guid: row.get(11)?,
                 })
@@ -936,7 +1002,7 @@ impl StorageManager {
     /// 搜索文章
     #[allow(unused)]
     pub async fn search_articles(&self, query: &str) -> anyhow::Result<Vec<Article>> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let search_pattern = format!("%{}%", query);
         let mut stmt = conn.prepare(
@@ -966,8 +1032,8 @@ impl StorageManager {
                         pub_date,
                         content: row.get(6)?,
                         summary: row.get(7)?,
-                        is_read: row.get::<_, i32>(8)? == 1,
-                        is_starred: row.get::<_, i32>(9)? == 1,
+                        is_read: row.get(8)?,
+                        is_starred: row.get(9)?,
                         source: row.get(10)?,
                         guid: row.get(11)?,
                     })
@@ -978,23 +1044,7 @@ impl StorageManager {
         Ok(articles)
     }
 
-    /// 清理旧文章（保留最近N篇）
-    #[allow(unused)]
-    pub async fn cleanup_old_articles(
-        &mut self,
-        feed_id: i64,
-        keep_count: u32,
-    ) -> anyhow::Result<()> {
-        let mut conn = self.get_connection();
-        let tx = conn.transaction()?;
 
-        // 简化删除逻辑，直接使用feed_id和LIMIT
-        let query = "DELETE FROM articles WHERE feed_id = ? AND id NOT IN (SELECT id FROM articles WHERE feed_id = ? ORDER BY pub_date DESC LIMIT ?)";
-        tx.execute(query, [feed_id, feed_id, keep_count as i64])?;
-
-        tx.commit()?;
-        Ok(())
-    }
 
     #[allow(unused)]
     pub async fn export_opml(&self) -> anyhow::Result<String> {
@@ -1066,7 +1116,7 @@ impl StorageManager {
         let groups = self.get_all_groups().await?;
 
         // 获取所有文章
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
              FROM articles"
@@ -1135,7 +1185,7 @@ impl StorageManager {
         }
 
         let import_data: ImportData = serde_json::from_str(&json)?;
-        let mut conn = self.get_connection();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         // 导入分组
@@ -1264,7 +1314,7 @@ impl StorageManager {
     /// 导出数据为SQL文件，支持DuckDB
     pub async fn export_to_sql(&self, export_path: &PathBuf) -> anyhow::Result<()>
     {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         let mut sql_content = String::new();
         
         // 添加文件头注释
@@ -1524,12 +1574,21 @@ impl StorageManager {
         &mut self,
         feed_id: i64,
         articles: Vec<Article>,
+        retention_days: u32, // 添加保留天数参数
     ) -> anyhow::Result<usize> {
-        let mut conn = self.get_connection();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut new_articles_count = 0;
 
+        // 计算清理日期
+        let cutoff_date = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+
         for article in articles {
+            // 检查文章发布时间是否超过保留天数（仅对非收藏文章生效）
+            if !article.is_starred && article.pub_date < cutoff_date {
+                continue; // 跳过超过保留天数的非收藏文章
+            }
+
             // 移除URL中的锚点部分用于重复检查
             let link_without_anchor = Self::remove_url_anchor(&article.link);
 
@@ -1571,8 +1630,8 @@ impl StorageManager {
                         article.pub_date,
                         cleaned_content,
                         cleaned_summary,
-                        article.is_read as i32,
-                        article.is_starred as i32,
+                        article.is_read,
+                        article.is_starred,
                         article.source,
                         article.guid, // 使用真实的GUID
                     ],
@@ -1591,7 +1650,7 @@ impl StorageManager {
 
     /// 获取指定订阅源的文章
     pub async fn get_articles_by_feed(&self, feed_id: i64) -> anyhow::Result<Vec<Article>> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1636,8 +1695,8 @@ impl StorageManager {
                     pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
-                    is_read: row.get::<_, i32>(8)? == 1,
-                    is_starred: row.get::<_, i32>(9)? == 1,
+                    is_read: row.get(8)?,
+                    is_starred: row.get(9)?,
                     source: row.get(10)?,
                     guid: row.get(11)?,
                 })
@@ -1654,7 +1713,7 @@ impl StorageManager {
         article_id: i64,
         read: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         conn.execute(
             "UPDATE articles SET is_read = ? WHERE id = ?",
@@ -1671,7 +1730,7 @@ impl StorageManager {
         article_id: i64,
         starred: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         conn.execute(
             "UPDATE articles SET is_starred = ? WHERE id = ?",
@@ -1687,7 +1746,7 @@ impl StorageManager {
         article_id: i64,
         new_content: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         conn.execute(
             "UPDATE articles SET content = ? WHERE id = ?",
@@ -1700,7 +1759,7 @@ impl StorageManager {
     /// 获取所有未读文章数量
     #[allow(unused)]
     pub async fn get_unread_count(&self) -> anyhow::Result<u32> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE is_read = 0",
@@ -1714,7 +1773,7 @@ impl StorageManager {
     /// 获取指定订阅源的未读文章数量
     #[allow(unused)]
     pub async fn get_feed_unread_count(&self, feed_id: i64) -> anyhow::Result<u32> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE feed_id = ? AND is_read = 0",
@@ -1727,7 +1786,7 @@ impl StorageManager {
 
     /// 获取单个文章
     pub async fn get_article(&self, article_id: i64) -> anyhow::Result<Article> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         let article = conn.query_row(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1764,7 +1823,7 @@ impl StorageManager {
     /// 删除指定订阅源的所有文章
     #[allow(unused)]
     pub async fn delete_feed_articles(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         conn.execute("DELETE FROM articles WHERE feed_id = ? AND is_starred = 0", params![feed_id])?;
 
@@ -1775,7 +1834,7 @@ impl StorageManager {
 
     /// 批量标记文章为已读
     pub async fn mark_all_as_read(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         match feed_id {
             Some(id) => {
@@ -1794,7 +1853,7 @@ impl StorageManager {
 
     /// 批量标记指定ID的文章为已读
     pub async fn mark_articles_as_read(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         for &id in article_ids {
             conn.execute(
                 "UPDATE articles SET is_read = 1 WHERE id = ?",
@@ -1806,7 +1865,7 @@ impl StorageManager {
 
     /// 删除单篇文章
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![article_id])?;
 
@@ -1815,7 +1874,7 @@ impl StorageManager {
 
     /// 批量删除文章
     pub async fn delete_all_articles(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
 
         match feed_id {
             Some(id) => {
@@ -1831,7 +1890,7 @@ impl StorageManager {
 
     /// 批量删除指定ID的文章
     pub async fn delete_articles(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.get_connection();
+        let conn = self.conn.lock().unwrap();
         for &id in article_ids {
             conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![id])?;
         }

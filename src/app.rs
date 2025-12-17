@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 // use tokio::time;
 // use regex::Regex;
 use std::sync::mpsc::channel;
@@ -39,14 +39,14 @@ enum AISendContentType {
 
 /// 异步切换文章收藏状态的辅助函数
 async fn toggle_article_starred_async(
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     article_id: i64,
     starred: bool,
     ui_tx: Sender<UiMessage>,
     current_is_read: bool,
 ) -> anyhow::Result<()> {
     // 更新数据库中的收藏状态
-    let mut storage = _storage.lock().await;
+    let mut storage = _storage.write().await;
     storage
         .update_article_starred_status(article_id, starred)
         .await?;
@@ -66,7 +66,7 @@ async fn toggle_article_starred_async(
 async fn update_feed_internal(
     feed_id: i64,
     feed_url: &str,
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     rss_fetcher: Arc<RssFetcher>,
     ai_client: Option<Arc<crate::ai_client::AIClient>>,
 ) -> anyhow::Result<()> {
@@ -74,7 +74,7 @@ async fn update_feed_internal(
     let mut articles = rss_fetcher.fetch_feed(feed_url).await?;
 
     // 获取订阅源信息，检查是否启用AI自动翻译
-    let storage_lock = _storage.lock().await;
+    let storage_lock = _storage.read().await;
     let feeds = storage_lock.get_all_feeds().await?;
     let feed = feeds.into_iter().find(|f| f.id == feed_id);
     drop(storage_lock); // 提前释放storage锁
@@ -85,7 +85,7 @@ async fn update_feed_internal(
             log::info!("开始为订阅源 {} 翻译文章", feed.title);
             
             // 先检查哪些文章已经存在于数据库中，避免重复翻译
-            let storage = _storage.lock().await;
+            let storage = _storage.read().await;
             let existing_articles = storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
             // 优化：使用&str作为HashSet的键，避免不必要的clone操作
             let existing_guids: std::collections::HashSet<&str> = existing_articles
@@ -160,13 +160,17 @@ async fn update_feed_internal(
             articles = translated_articles;
         }
 
+    // 获取配置的保留天数
+    let config = crate::config::AppConfig::load_or_default();
+    let retention_days = config.article_retention_days;
+    
     // 更新订阅源信息和添加文章
-    let mut storage_lock = _storage.lock().await;
+    let mut storage_lock = _storage.write().await;
     storage_lock.update_feed_last_updated(feed_id).await?;
 
     // 批量添加所有获取到的文章，数据库层面会处理重复文章的问题
     if !articles.is_empty() {
-        storage_lock.add_articles(feed_id, articles).await?;
+        storage_lock.add_articles(feed_id, articles, retention_days).await?;
     }
 
     Ok(())
@@ -174,10 +178,10 @@ async fn update_feed_internal(
 
 /// 从存储中加载特定订阅源的文章
 pub async fn load_articles_for_feed(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     feed_id: i64,
 ) -> anyhow::Result<Vec<Article>> {
-    let storage_lock = storage.lock().await;
+    let storage_lock = storage.read().await;
     // 当选择全部文章时（feed_id = -1），使用get_all_articles而不是get_articles_by_feed
     if feed_id == -1 {
         storage_lock.get_all_articles().await
@@ -187,7 +191,7 @@ pub async fn load_articles_for_feed(
 }
 
 pub async fn perform_auto_update(
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     rss_fetcher: Arc<RssFetcher>,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Sender<UiMessage>,
@@ -197,7 +201,7 @@ pub async fn perform_auto_update(
     log::info!("开始执行自动更新");
 
     // 获取所有订阅源
-    let storage_lock = _storage.lock().await;
+    let storage_lock = _storage.read().await;
     let feeds = storage_lock.get_all_feeds().await?;
     drop(storage_lock); // 提前释放锁
 
@@ -244,7 +248,7 @@ pub async fn perform_auto_update(
             let mut new_article_titles = Vec::new();
 
             // 获取更新前的文章数量
-            let old_articles = match storage_clone.lock().await.get_articles_by_feed(feed_id).await {
+            let old_articles = match storage_clone.read().await.get_articles_by_feed(feed_id).await {
                 Ok(articles) => articles,
                 Err(e) => {
                     log::error!("获取订阅源文章失败 (ID: {}): {:?}", feed_id, e);
@@ -265,7 +269,7 @@ pub async fn perform_auto_update(
                 result = Err(e);
             } else {
                 // 获取更新后的文章数量
-                let new_articles = match storage_clone.lock().await.get_articles_by_feed(feed_id).await {
+                let new_articles = match storage_clone.read().await.get_articles_by_feed(feed_id).await {
                     Ok(articles) => articles,
                     Err(e) => {
                         log::error!("获取更新后文章失败 (ID: {}): {:?}", feed_id, e);
@@ -367,6 +371,27 @@ pub async fn perform_auto_update(
     // 发送全部更新完成消息
     let _ = ui_tx.send(UiMessage::AllFeedsRefreshed);
 
+    // 自动清理旧文章（在所有订阅源更新完成后执行）
+    let config = crate::config::AppConfig::load_or_default();
+    if config.enable_auto_cleanup {
+        log::info!("开始执行自动清理旧文章");
+        let  storage_write = _storage.write().await;
+        match storage_write.cleanup_old_articles(config.article_retention_days, config.max_articles_per_feed).await {
+            Ok(deleted_count) => {
+                log::info!("自动清理旧文章完成，删除了 {} 篇文章", deleted_count);
+                // 执行VACUUM操作，回收磁盘空间
+                if let Err(e) = storage_write.vacuum_database().await {
+                    log::warn!("执行VACUUM操作失败: {:?}", e);
+                } else {
+                    log::info!("VACUUM操作执行成功");
+                }
+            },
+            Err(e) => {
+                log::error!("执行自动清理旧文章失败: {:?}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -378,7 +403,7 @@ async fn add_feed_async(
     feed_group: String,
     auto_update: bool, // 添加自动更新参数
     ai_auto_translate: bool, // 添加AI自动翻译参数
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     rss_fetcher: Arc<RssFetcher>,
     _feed_manager: Arc<Mutex<FeedManager>>,
     ui_tx: Sender<UiMessage>, // 添加UI消息通道参数
@@ -411,7 +436,7 @@ async fn add_feed_async(
     };
 
     // 保存订阅源到数据库
-    let mut storage = _storage.lock().await;
+    let mut storage = _storage.write().await;
     let feed_id = storage.add_feed(new_feed).await?;
 
     // 保存文章
@@ -490,23 +515,35 @@ async fn add_feed_async(
                     translated_articles
                 }).await;
                 
-                // 使用翻译后的文章
-                if let Ok(translated) = translated_articles
-                    && !translated.is_empty() {
-                    let new_articles_count = storage.add_articles(feed_id, translated).await?;
-                    log::info!("成功保存 {} 篇文章", new_articles_count);
-                }
+                // 获取配置的保留天数
+                        let config = crate::config::AppConfig::load_or_default();
+                        let retention_days = config.article_retention_days;
+                        
+                        // 使用翻译后的文章
+                        if let Ok(translated) = translated_articles
+                            && !translated.is_empty() {
+                            let new_articles_count = storage.add_articles(feed_id, translated, retention_days).await?;
+                            log::info!("成功保存 {} 篇文章", new_articles_count);
+                        }
             } else {
+                // 获取配置的保留天数
+                let config = crate::config::AppConfig::load_or_default();
+                let retention_days = config.article_retention_days;
+                
                 // 如果AI客户端创建失败，直接保存原始文章
                 if !articles.is_empty() {
-                    let new_articles_count = storage.add_articles(feed_id, articles).await?;
+                    let new_articles_count = storage.add_articles(feed_id, articles, retention_days).await?;
                     log::info!("成功保存 {} 篇文章", new_articles_count);
                 }
             }
         } else {
+            // 获取配置的保留天数
+            let config = crate::config::AppConfig::load_or_default();
+            let retention_days = config.article_retention_days;
+            
             // 如果没有启用AI自动翻译，直接保存原始文章
             if !articles.is_empty() {
-                let new_articles_count = storage.add_articles(feed_id, articles).await?;
+                let new_articles_count = storage.add_articles(feed_id, articles, retention_days).await?;
                 log::info!("成功保存 {} 篇文章", new_articles_count);
             }
         }
@@ -517,7 +554,7 @@ async fn add_feed_async(
 
     // 重新加载所有订阅源并发送消息刷新UI
     log::debug!("添加订阅源后重新加载所有订阅源以更新UI");
-    let feeds = _storage.lock().await.get_all_feeds().await?;
+    let feeds = _storage.read().await.get_all_feeds().await?;
 
     // 发送FeedsLoaded消息来刷新UI
     log::debug!("发送FeedsLoaded消息，包含{}个订阅源", feeds.len());
@@ -543,7 +580,7 @@ async fn add_feed_async(
 
 /// 异步导入OPML文件的辅助函数
 async fn import_opml_async(
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     _feed_manager: Arc<Mutex<FeedManager>>,
     file_path: &str,
 ) -> anyhow::Result<usize> {
@@ -580,7 +617,7 @@ async fn import_opml_async(
 
             // 检查URL是否已存在于系统中
             let url_exists = {
-                let storage_lock = _storage.lock().await;
+                let storage_lock = _storage.read().await;
                 let all_feeds = storage_lock.get_all_feeds().await?;
                 all_feeds.iter().any(|f| f.url == url)
             };
@@ -607,7 +644,7 @@ async fn import_opml_async(
             };
 
             // 保存到数据库
-            let mut storage = _storage.lock().await;
+            let mut storage = _storage.write().await;
             storage.add_feed(feed).await?;
             feed_count += 1;
         } else {
@@ -622,7 +659,7 @@ async fn import_opml_async(
             
             // 确保分组信息被添加到数据库中
             if !group_name.is_empty() {
-                let mut storage = _storage.lock().await;
+                let mut storage = _storage.write().await;
                 // 添加分组，使用INSERT OR IGNORE避免重复
                 storage.add_group(&group_name, None).await?;
             }
@@ -639,11 +676,11 @@ async fn import_opml_async(
 
 /// 异步导出OPML文件的辅助函数
 async fn export_opml_async(
-    _storage: Arc<Mutex<StorageManager>>,
+    _storage: Arc<RwLock<StorageManager>>,
     file_path: &str,
 ) -> anyhow::Result<()> {
     // 获取所有订阅源
-    let storage = _storage.lock().await;
+    let storage = _storage.read().await;
     let feeds = storage.get_all_feeds().await?;
 
     // 生成符合OPML规范的XML内容
@@ -765,7 +802,7 @@ pub struct App {
     config: AppConfig,
 
     // 存储管理器
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
 
     // RSS获取器
     rss_fetcher: Arc<RssFetcher>,
@@ -956,7 +993,7 @@ impl App {
         let config = AppConfig::load_or_default();
 
         // 初始化存储管理器
-        let storage = Arc::new(Mutex::new(StorageManager::new(
+        let storage = Arc::new(RwLock::new(StorageManager::new(
             config.database_path.clone(),
         )));
 
@@ -1343,7 +1380,7 @@ impl App {
 
                 // 使用tokio::spawn在后台加载最新文章数据
                 tokio::spawn(async move {
-                    let storage_lock = storage_clone.lock().await;
+                    let storage_lock = storage_clone.read().await;
                     let articles_result = if feed_id == -1 {
                         // 当选择全部文章时，获取所有文章
                         storage_lock.get_all_articles().await
@@ -1430,7 +1467,7 @@ impl App {
 
     /// 初始化数据的异步函数（新方法）
     pub fn initialize_data_async(
-        storage: Arc<Mutex<StorageManager>>,
+        storage: Arc<RwLock<StorageManager>>,
         ui_tx: Sender<UiMessage>,
         search_manager: Arc<Mutex<SearchManager>>,
     ) {
@@ -1440,7 +1477,7 @@ impl App {
             // 读取自动更新间隔配置
             {
                 log::debug!("获取存储管理器的锁（读取更新间隔）");
-                let storage_lock = storage.lock().await;
+                let storage_lock = storage.read().await;
                 if let Ok(update_interval) = storage_lock.get_update_interval().await {
                     log::info!("从数据库读取的自动更新间隔: {} 分钟", update_interval);
                     // 发送更新间隔消息给UI
@@ -1453,7 +1490,7 @@ impl App {
 
             // 继续原有的初始化逻辑
             log::debug!("获取存储管理器的锁（加载数据）");
-            let mut storage_lock = storage.lock().await;
+            let mut storage_lock = storage.write().await;
             
             // 数据迁移逻辑已集成到init_database和feed操作方法中，无需单独执行
             log::debug!("数据迁移逻辑已集成，跳过单独迁移步骤");
@@ -1536,10 +1573,14 @@ impl App {
                             source: "示例源".to_string(),
                         };
 
+                        // 获取配置的保留天数
+                        let config = crate::config::AppConfig::load_or_default();
+                        let retention_days = config.article_retention_days;
+                        
                         // 使用add_articles方法（需要传递一个Vec）
                         log::debug!("将示例文章添加到数据库");
                         if let Err(e) = storage_lock
-                            .add_articles(feed_id, vec![example_article])
+                            .add_articles(feed_id, vec![example_article], retention_days)
                             .await
                         {
                             log::error!("添加示例文章失败: {}", e);
@@ -1710,7 +1751,7 @@ impl App {
                     // 先获取storage锁，收集所有文章
                     {
                         log::debug!("获取storage锁");
-                        let storage_lock = storage_clone.lock().await;
+                        let storage_lock = storage_clone.read().await;
                         log::debug!("成功获取storage锁");
 
                         // 加载所有订阅源的文章并收集
@@ -1788,7 +1829,7 @@ impl App {
                 
                 // 使用tokio::spawn在后台加载最新文章数据
                 tokio::spawn(async move {
-                    let storage_lock = storage_clone.lock().await;
+                    let storage_lock = storage_clone.read().await;
                     let articles_result = if feed_id == -1 {
                         // 当选择全部文章时，获取所有文章
                         storage_lock.get_all_articles().await
@@ -2822,13 +2863,14 @@ impl eframe::App for App {
                         .map_or(0, |d| d.as_secs());
 
                     // 重新加载所有订阅源，以便更新分组列表
+                    // 特别是当修改分组名称后，需要重新加载订阅源来更新每个订阅源的group字段
                     let storage_clone = Arc::clone(&self.storage);
                     let ui_tx_clone = self.ui_tx.clone();
 
                     // 在异步任务中执行，避免阻塞UI线程
                     tokio::spawn(async move {
                         // 重新加载所有订阅源
-                        match storage_clone.lock().await.get_all_feeds().await {
+                        match storage_clone.read().await.get_all_feeds().await {
                             Ok(feeds) => {
                                 // 发送FeedsLoaded消息到UI线程，更新订阅源列表和分组
                                 let _ = ui_tx_clone.send(UiMessage::FeedsLoaded(feeds));
@@ -3002,11 +3044,14 @@ impl eframe::App for App {
                 UiMessage::UpdateIntervalLoaded(interval) => {
                     // 更新自动更新间隔
                     log::debug!("收到更新间隔加载消息: {}分钟", interval);
-                    self.auto_update_interval = interval;
-                    // 更新自动更新任务的间隔
-                    // 由于set_auto_update_interval是异步的，这里直接重启任务
-                    if self.auto_update_enabled {
-                        self.start_auto_update();
+                    // 只有当间隔实际变化时才更新并重启任务
+                    if self.auto_update_interval != interval {
+                        self.auto_update_interval = interval;
+                        // 更新自动更新任务的间隔
+                        // 由于set_auto_update_interval是异步的，这里直接重启任务
+                        if self.auto_update_enabled {
+                            self.start_auto_update();
+                        }
                     }
                 }
                 UiMessage::AutoUpdateEnabledChanged(enabled) => {
@@ -3027,7 +3072,7 @@ impl eframe::App for App {
                         // 克隆storage的Arc引用，避免移动整个self
                         let storage_clone = Arc::clone(&self.storage);
                         if let Ok(articles) = futures::executor::block_on(async move {
-                            let storage_lock = storage_clone.lock().await;
+                            let storage_lock = storage_clone.read().await;
                             // 当选择全部文章时（feed_id = -1），使用get_all_articles而不是get_articles_by_feed
                             if feed_id == -1 {
                                 storage_lock.get_all_articles().await
@@ -3207,17 +3252,10 @@ impl eframe::App for App {
             }
         }
 
-        // 首次更新时初始化数据
-        if self.feeds.is_empty() {
-            // 现在使用异步任务初始化数据
-            self.is_initializing = true;
-            let ui_tx = self.ui_tx.clone();
-            let storage = self.storage.clone();
-
-            // 调用初始化函数，传入storage、消息发送器和search_manager
-            App::initialize_data_async(storage, ui_tx, self.search_manager.clone());
-        } else if self.articles.is_empty() && self.selected_feed_id.is_some() {
-            // 如果有订阅源但没有文章数据，立即添加示例文章
+        // 首次更新时初始化数据 - 现在只在new_internal方法中调用initialize_data_async
+        // 不再在update方法中重复调用，避免多次触发异步初始化
+        if self.articles.is_empty() && self.selected_feed_id.is_some() && !self.is_initializing {
+            // 如果有订阅源但没有文章数据，且不在初始化状态，添加示例文章
             let example_article = Article {
                 id: 1,
                 feed_id: self.selected_feed_id.unwrap_or(-1),
@@ -3282,8 +3320,12 @@ impl eframe::App for App {
                             }
                         };
                         
+                        // 获取配置的保留天数
+                        let config = crate::config::AppConfig::load_or_default();
+                        let retention_days = config.article_retention_days;
+                        
                         // 存储文章
-                        if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
+                        if let Err(e) = storage.write().await.add_articles(feed.id, articles, retention_days).await {
                             log::error!(
                                 "Failed to parse and store articles for feed {}: {}",
                                 feed.title,
@@ -3347,7 +3389,7 @@ impl eframe::App for App {
                                     Ok(feed_count) => {
                                         log::info!("OPML导入成功，共{}个订阅源", feed_count);
                                         // 重新加载订阅源列表
-                                        if let Ok(feeds) = storage.lock().await.get_all_feeds().await
+                                        if let Ok(feeds) = storage.read().await.get_all_feeds().await
                                             && let Err(e) = ui_tx.send(UiMessage::FeedsLoaded(feeds)) {
                                                 log::error!("发送订阅源更新消息失败: {}", e);
                                             }
@@ -3439,7 +3481,7 @@ impl eframe::App for App {
                             for feed in feeds {
                                 // 获取更新前的文章
                                 let old_articles = {
-                                    let storage_lock = storage.lock().await;
+                                    let storage_lock = storage.read().await;
                                     storage_lock.get_articles_by_feed(feed.id).await.unwrap_or_default()
                                 };
                                 let old_article_count = old_articles.len();
@@ -3447,12 +3489,16 @@ impl eframe::App for App {
                                 // 获取订阅源内容
                                 match rss_fetcher.fetch_feed(&feed.url).await {
                                     Ok(articles) => {
+                                        // 获取配置的保留天数
+                                        let config = crate::config::AppConfig::load_or_default();
+                                        let retention_days = config.article_retention_days;
+                                        
                                         // 存储文章
-                                        if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
+                                        if let Err(e) = storage.write().await.add_articles(feed.id, articles, retention_days).await {
                                             log::error!("Failed to parse and store articles for feed {}: {}", feed.title, e);
                                         } else {
                                             // 获取更新后的文章数量
-                                            let new_articles = storage.lock().await.get_articles_by_feed(feed.id).await.unwrap_or_default();
+                                            let new_articles = storage.read().await.get_articles_by_feed(feed.id).await.unwrap_or_default();
                                             let current_article_count = new_articles.len();
                                             
                                             // 检查是否有新文章
@@ -3700,6 +3746,25 @@ impl eframe::App for App {
                         }
                     });
                     
+                    // 自动清理设置
+                    ui.menu_button("自动清理设置", |ui| {
+                        if ui.checkbox(&mut self.config.enable_auto_cleanup, "启用自动清理旧文章").changed() {
+                            if let Err(e) = self.config.save() {
+                                log::error!("Failed to save auto cleanup setting: {}", e);
+                            }
+                        }
+                        
+                        ui.add(egui::Slider::new(&mut self.config.article_retention_days, 7..=365).text("文章保留天数"));
+                        ui.add(egui::Slider::new(&mut self.config.max_articles_per_feed, 10..=1000).text("每个订阅源保留最大文章数"));
+                        
+                        if ui.button("保存自动清理设置").clicked() {
+                            if let Err(e) = self.config.save() {
+                                log::error!("Failed to save auto cleanup settings: {}", e);
+                            }
+                            ui.close();
+                        }
+                    });
+                    
                     // AI设置
                     ui.separator();
                     if ui.button("AI设置").clicked() {
@@ -3724,7 +3789,7 @@ impl eframe::App for App {
                         let storage = self.storage.clone();
                         let ui_tx = self.ui_tx.clone();
                         tokio::spawn(async move {
-                            let mut storage_lock = storage.lock().await;
+                            let mut storage_lock = storage.write().await;
                             if let Err(e) = storage_lock.set_auto_update_enabled(auto_update_enabled).await {
                                 log::error!("保存自动更新状态失败: {}", e);
                                 if let Err(e) = ui_tx.send(UiMessage::Error(format!("保存设置失败: {}", e))) {
@@ -3748,7 +3813,7 @@ impl eframe::App for App {
                             let storage = self.storage.clone();
                             let ui_tx = self.ui_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = storage.lock().await.set_update_interval(update_interval).await {
+                                if let Err(e) = storage.write().await.set_update_interval(update_interval).await {
                                     log::error!("保存更新间隔失败: {}", e);
                                     if let Err(e) = ui_tx.send(UiMessage::Error(format!("保存设置失败: {}", e))) {
                                         log::error!("发送错误消息失败: {}", e);
@@ -3802,7 +3867,7 @@ impl eframe::App for App {
                     let ui_tx = self.ui_tx.clone();
                     tokio::spawn(async move {
                         // 使用StorageManager的get_all_articles方法
-                        let storage_lock = storage.lock().await;
+                        let storage_lock = storage.read().await;
                         match storage_lock.get_all_articles().await {
                             Ok(articles) => {
                                 if let Err(e) = ui_tx.send(UiMessage::ArticlesLoaded(articles)) {
@@ -3903,7 +3968,7 @@ impl eframe::App for App {
 
                                 tokio::spawn(async move {
                                     // 开始删除操作
-                                    let mut storage_guard = storage.lock().await;
+                                    let mut storage_guard = storage.write().await;
 
                                     // 先删除该订阅源的所有文章
                                     if let Err(e) =
@@ -4025,7 +4090,7 @@ impl eframe::App for App {
 
                                         tokio::spawn(async move {
                                             // 开始删除操作
-                                            let mut storage_guard = storage.lock().await;
+                                            let mut storage_guard = storage.write().await;
 
                                             // 先删除该订阅源的所有文章
                                             if let Err(e) =
@@ -4232,7 +4297,7 @@ impl eframe::App for App {
                             if feed_id == -1 {
                                 // 刷新所有订阅源的逻辑
                                 let feeds = {
-                                    let storage_lock = storage.lock().await;
+                                    let storage_lock = storage.read().await;
                                     match storage_lock.get_all_feeds().await {
                                         Ok(feeds) => feeds,
                                         Err(e) => {
@@ -4525,7 +4590,7 @@ impl eframe::App for App {
                             let ui_tx_clone = self.ui_tx.clone();
                             
                             tokio::spawn(async move {
-                                let mut storage = storage_clone.lock().await;
+                                let mut storage = storage_clone.write().await;
                                 if storage.mark_articles_as_read(&article_ids).await.is_ok() {
                                     let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量标记为已读".to_string()));
                                     let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
@@ -4543,7 +4608,7 @@ impl eframe::App for App {
                             let ui_tx_clone = self.ui_tx.clone();
                             
                             tokio::spawn(async move {
-                                let mut storage = storage_clone.lock().await;
+                                let mut storage = storage_clone.write().await;
                                 if storage.delete_articles(&article_ids).await.is_ok() {
                                     let _ = ui_tx_clone.send(UiMessage::StatusMessage("文章已批量删除".to_string()));
                                     let _ = ui_tx_clone.send(UiMessage::ReloadArticles);
@@ -4812,7 +4877,7 @@ impl eframe::App for App {
                                     let ui_tx = self.ui_tx.clone();
                                     
                                     tokio::spawn(async move {
-                                        let mut storage = storage.lock().await;
+                                        let mut storage = storage.write().await;
                                         if let Err(e) = storage.update_article_content(article_id, &new_content).await {
                                             log::error!("更新文章内容失败: {}", e);
                                             let _ = ui_tx.send(UiMessage::Error(format!("更新文章内容失败: {}", e)));
@@ -5709,7 +5774,7 @@ impl eframe::App for App {
 
 /// 刷新单个订阅源的异步辅助函数
 async fn refresh_single_feed_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     rss_fetcher: Arc<RssFetcher>,
     feed_id: i64,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
@@ -5718,7 +5783,7 @@ async fn refresh_single_feed_async(
 ) -> anyhow::Result<()> {
     // 获取订阅源信息
     let feed = {
-        let storage = storage.lock().await;
+        let storage = storage.read().await;
         let feeds = storage.get_all_feeds().await?;
         feeds
             .into_iter()
@@ -5728,7 +5793,7 @@ async fn refresh_single_feed_async(
 
     // 获取更新前的文章
     let old_articles = {
-        let storage_lock = storage.lock().await;
+        let storage_lock = storage.read().await;
         storage_lock.get_articles_by_feed(feed.id).await?
     };
     let old_article_count = old_articles.len();
@@ -5738,7 +5803,7 @@ async fn refresh_single_feed_async(
 
     // 获取更新后的文章数量和列表
     let (current_article_count, new_articles) = {
-        let storage_lock = storage.lock().await;
+        let storage_lock = storage.read().await;
         let new_articles = storage_lock.get_articles_by_feed(feed.id).await?;
         (new_articles.len(), new_articles)
     };
@@ -5783,11 +5848,11 @@ async fn refresh_single_feed_async(
 
 /// 标记文章为已读的异步辅助函数
 async fn mark_article_as_read_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     article_id: i64,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
-    let mut storage = storage.lock().await;
+    let mut storage = storage.write().await;
     storage.update_article_read_status(article_id, true).await?;
 
     // 发送消息更新UI状态
@@ -5798,11 +5863,11 @@ async fn mark_article_as_read_async(
 
 /// 标记所有文章为已读的异步辅助函数
 async fn mark_all_as_read_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     feed_id: Option<i64>,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
-    let mut storage = storage.lock().await;
+    let mut storage = storage.write().await;
     storage.mark_all_as_read(feed_id).await?;
 
     // 发送消息更新UI状态
@@ -5821,12 +5886,12 @@ async fn mark_all_as_read_async(
 
 /// 删除文章的异步辅助函数
 async fn delete_article_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     search_manager: Arc<Mutex<SearchManager>>,
     article_id: i64,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
-    let mut storage = storage.lock().await;
+    let mut storage = storage.write().await;
 
     // 获取文章信息，以便获取 feed_id
     let article = storage.get_article(article_id).await?;
@@ -5852,12 +5917,12 @@ async fn delete_article_async(
 }
 
 async fn delete_all_articles_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     search_manager: Arc<Mutex<SearchManager>>,
     feed_id: Option<i64>,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
-    let mut storage = storage.lock().await;
+    let mut storage = storage.write().await;
     storage.delete_all_articles(feed_id).await?;
      drop(storage);
     // 加载配置，判断是否需要更新搜索索引
@@ -5887,11 +5952,11 @@ async fn delete_all_articles_async(
 
 /// 异步获取特定订阅源的文章并更新UI
 async fn get_articles_by_feed_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     feed_id: i64,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
-    let storage = storage.lock().await;
+    let storage = storage.read().await;
     match storage.get_articles_by_feed(feed_id).await {
         Ok(articles) => {
             // 通过消息通道将文章数据发送到UI线程
@@ -5916,7 +5981,7 @@ async fn get_articles_by_feed_async(
 /// 异步更新订阅源信息的辅助函数
 #[allow(clippy::too_many_arguments)]
 async fn update_feed_async(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     ui_tx: Sender<UiMessage>,
     feed_id: i64,
     title: String,
@@ -5933,7 +5998,7 @@ async fn update_feed_async(
     }
 
     // 获取现有的订阅源信息
-    let mut feed = match storage.lock().await.get_all_feeds().await {
+    let mut feed = match storage.read().await.get_all_feeds().await {
         Ok(feeds) => feeds
             .into_iter()
             .find(|f| f.id == feed_id)
@@ -5951,14 +6016,14 @@ async fn update_feed_async(
         feed.ai_auto_translate = ai_auto_translate; // 更新AI自动翻译设置
 
         // 保存到数据库
-        if let Err(e) = storage.lock().await.update_feed(feed).await {
+        if let Err(e) = storage.write().await.update_feed(feed).await {
             log::error!("更新订阅源失败: {}", e);
             let _ = ui_tx.send(UiMessage::Error(format!("更新订阅源失败: {}", e)));
             return;
         }
 
         // 重新加载所有订阅源以更新UI
-        if let Ok(feeds) = storage.lock().await.get_all_feeds().await {
+        if let Ok(feeds) = storage.read().await.get_all_feeds().await {
             let _ = ui_tx.send(UiMessage::FeedsLoaded(feeds));
             let _ = ui_tx.send(UiMessage::StatusMessage(format!(
                 "成功更新订阅源: {}",

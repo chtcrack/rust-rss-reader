@@ -397,8 +397,8 @@ impl RssFetcher {
 
         // 6. 尝试使用GBK编码的另一种实现方式
         log::info!("尝试使用GBK编码的替代实现解析");
-        // 导入encoding_rs的GBK常量
-        use encoding_rs::GBK;
+        // 导入encoding_rs的编码常量
+        use encoding_rs::{GBK, EUC_KR};
         let (text, _encoding, _had_errors) = GBK.decode(&body);
         match Channel::read_from(text.as_bytes()) {
             Ok(channel) => {
@@ -406,6 +406,18 @@ impl RssFetcher {
                 return Ok(self.parse_items_to_articles(&channel));
             }
             Err(e) => log::error!("GBK替代实现解码后解析失败: {:?}", e),
+        }
+        
+        // 7. 尝试使用EUC-KR编码（韩文编码）
+        log::info!("尝试使用EUC-KR编码解析");
+        let (text, _encoding, _had_errors) = EUC_KR.decode(&body);
+        let text_bytes = text.as_bytes();
+        match Channel::read_from(text_bytes) {
+            Ok(channel) => {
+                log::info!("🎉 EUC-KR解码后解析成功");
+                return Ok(self.parse_items_to_articles(&channel));
+            }
+            Err(e) => log::error!("EUC-KR解码后解析失败: {:?}", e),
         }
 
         // 7. 尝试对文本进行清理和预处理

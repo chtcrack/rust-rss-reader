@@ -22,7 +22,6 @@ pub fn test_database_initialization() {
 // 测试导出到SQL文件功能
 pub async fn test_export_to_sql() {
     println!("开始测试导出到SQL文件功能...");
-
     // 获取默认数据库路径
     let db_path = "feed.duckdb";
     println!("使用数据库路径: {}", db_path);

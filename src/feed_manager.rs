@@ -5,19 +5,19 @@ use crate::notification::NotificationManager;
 use crate::storage::StorageManager;
 use crate::utils::{get_domain_from_url, is_valid_url};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 /// RSS源管理器
 pub struct FeedManager {
     /// 存储管理器
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<RwLock<StorageManager>>,
     /// 通知管理器
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
 }
 
 impl FeedManager {
     /// 创建新的RSS源管理器
-    pub fn new(storage: Arc<Mutex<StorageManager>>) -> Self {
+    pub fn new(storage: Arc<RwLock<StorageManager>>) -> Self {
         Self {
             storage,
             notification_manager: None,
@@ -65,7 +65,7 @@ impl FeedManager {
         }
 
         // 保存到数据库
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
         let feed_id = storage.add_feed(feed.clone()).await?;
 
         // 设置返回的Feed的ID
@@ -76,14 +76,14 @@ impl FeedManager {
 
     /// 获取所有RSS源
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         storage.get_all_feeds().await
     }
 
     /// 获取分组列表
     #[allow(unused)]
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         // 直接从数据库获取所有分组，包含真实的ID
         storage.get_all_groups().await
     }
@@ -101,14 +101,14 @@ impl FeedManager {
             return Err(anyhow::anyhow!("标题不能为空"));
         }
 
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
         storage.update_feed(feed).await
     }
 
     /// 更新RSS源的分组
     #[allow(unused)]
     pub async fn update_feed_group(&self, feed_id: i64, group: &str) -> anyhow::Result<()> {
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
         let mut feeds = storage.get_all_feeds().await?;
 
         if let Some(feed) = feeds.iter_mut().find(|f| f.id == feed_id) {
@@ -124,14 +124,14 @@ impl FeedManager {
     /// 删除RSS源
     #[allow(unused)]
     pub async fn delete_feed(&self, feed_id: i64) -> anyhow::Result<()> {
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
         storage.delete_feed(feed_id).await
     }
 
     /// 批量删除RSS源
     #[allow(unused)]
     pub async fn delete_feeds(&self, feed_ids: &[i64]) -> anyhow::Result<()> {
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
 
         for &feed_id in feed_ids {
             storage.delete_feed(feed_id).await?;
@@ -143,7 +143,7 @@ impl FeedManager {
     /// 按分组获取RSS源
     #[allow(unused)]
     pub async fn get_feeds_by_group(&self, group: &str) -> anyhow::Result<Vec<Feed>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         let feeds = storage.get_all_feeds().await?;
 
         // 过滤指定分组的订阅源
@@ -158,7 +158,7 @@ impl FeedManager {
     /// 搜索RSS源
     #[allow(unused)]
     pub async fn search_feeds(&self, query: &str) -> anyhow::Result<Vec<Feed>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         let feeds = storage.get_all_feeds().await?;
 
         let query_lower = query.to_lowercase();
@@ -179,7 +179,7 @@ impl FeedManager {
     /// 检查RSS源是否已存在
     #[allow(unused)]
     pub async fn feed_exists(&self, url: &str) -> anyhow::Result<bool> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         let feeds = storage.get_all_feeds().await?;
 
         Ok(feeds.iter().any(|feed| feed.url == url))
@@ -192,7 +192,7 @@ impl FeedManager {
             return Err(anyhow::anyhow!("分组名称不能为空"));
         }
         log::debug!("feed_manger获取分组ID: {}，对应新名称: '{}'", group_id, new_name);
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
 
         // 调用StorageManager的update_group_name方法，同时更新feed_groups表和所有相关订阅源
         storage
@@ -205,7 +205,7 @@ impl FeedManager {
     /// 通过名称获取分组ID
     #[allow(unused)]
     pub async fn get_group_id_by_name(&self, group_name: &str) -> anyhow::Result<Option<i64>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         let groups = storage.get_all_groups().await?;
         
         Ok(groups.into_iter().find(|g| g.name == group_name).map(|g| g.id))
@@ -214,7 +214,7 @@ impl FeedManager {
     /// 删除分组（将所有属于该分组的订阅源移动到未分组）
     #[allow(unused)]
     pub async fn delete_group(&self, group_id: i64) -> anyhow::Result<()> {
-        let mut storage = self.storage.lock().await;
+        let mut storage = self.storage.write().await;
         
         // 将所有属于该分组的订阅源移动到未分组
         storage.delete_group(group_id).await?;
@@ -227,7 +227,7 @@ impl FeedManager {
     pub async fn get_group_stats(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, usize>> {
-        let storage = self.storage.lock().await;
+        let storage = self.storage.read().await;
         let feeds = storage.get_all_feeds().await?;
 
         let mut stats = std::collections::HashMap::new();
