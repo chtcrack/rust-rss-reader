@@ -3748,10 +3748,10 @@ impl eframe::App for App {
                     
                     // 自动清理设置
                     ui.menu_button("自动清理设置", |ui| {
-                        if ui.checkbox(&mut self.config.enable_auto_cleanup, "启用自动清理旧文章").changed() {
-                            if let Err(e) = self.config.save() {
-                                log::error!("Failed to save auto cleanup setting: {}", e);
-                            }
+                        if ui.checkbox(&mut self.config.enable_auto_cleanup, "启用自动清理旧文章").changed()
+                            && let Err(e) = self.config.save()
+                        {
+                            log::error!("Failed to save auto cleanup setting: {}", e);
                         }
                         
                         ui.add(egui::Slider::new(&mut self.config.article_retention_days, 7..=365).text("文章保留天数"));

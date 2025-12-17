@@ -218,7 +218,6 @@ impl StorageManager {
 
     /// 初始化数据库表
     fn init_database(conn: &duckdb::Connection) -> DuckDBResult<()> {
-        conn.execute("PRAGMA encoding='UTF-8';", [])?;
         // 创建订阅源分组表的序列
         conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS feed_groups_id_seq START 1;",
@@ -410,7 +409,7 @@ impl StorageManager {
         log::info!("开始添加订阅源，URL: {}", feed.url);
         
         // 获取数据库连接
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         log::info!("获取数据库连接成功");
         
         // 开始事务，将所有操作放在一个事务中
@@ -513,7 +512,7 @@ impl StorageManager {
     /// 执行数据库VACUUM操作，清理过期数据版本，回收磁盘空间
     #[allow(unused)]
     pub async fn vacuum_database(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         
         // 执行VACUUM命令
         conn.execute("VACUUM", [])?;
@@ -524,7 +523,7 @@ impl StorageManager {
     /// 清理旧文章，根据配置删除超过保留天数或超过每个订阅源最大文章数的旧文章
     #[allow(unused)]
     pub async fn cleanup_old_articles(&self, retention_days: u32, max_articles_per_feed: u32) -> anyhow::Result<usize> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         let tx = conn.transaction()?;
         
         // 计算清理日期
@@ -563,7 +562,7 @@ impl StorageManager {
     /// 获取所有订阅源
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
         // 获取新的数据库连接
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         // 使用更简单的查询，避免复杂的JOIN和COALESCE
         // 直接获取订阅源和分组信息，DuckDB应该能正确处理
@@ -624,7 +623,7 @@ impl StorageManager {
 
     /// 更新订阅源信息
     pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         
         // 处理分组逻辑
         let group_id = if feed.group.is_empty() {
@@ -680,7 +679,7 @@ impl StorageManager {
 
     /// 更新订阅源最后更新时间
     pub async fn update_feed_last_updated(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
         let now = Utc::now();
@@ -694,7 +693,7 @@ impl StorageManager {
 
     /// 删除订阅源
     pub async fn delete_feed(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         // 先删除相关的文章
         conn.execute("DELETE FROM articles WHERE feed_id = ?", params![feed_id])?;
@@ -707,7 +706,7 @@ impl StorageManager {
 
     /// 获取所有订阅源分组
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
-          let conn = self.conn.lock().unwrap();
+          let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let mut stmt = conn.prepare("SELECT id, name, icon FROM feed_groups ORDER BY name")?;
 
@@ -750,7 +749,7 @@ impl StorageManager {
     /// 添加分组
     #[allow(unused)]
     pub async fn add_group(&mut self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         // 验证分组名称不为空
         if group_name.trim().is_empty() {
@@ -799,7 +798,7 @@ impl StorageManager {
     ) -> anyhow::Result<()> {
         log::debug!("[update_group_name] 开始执行，group_id: {}, new_name: '{}'", group_id, new_name);
         
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         
         // 检查新名称是否已被其他分组使用
         let mut name_check_stmt = conn.prepare("SELECT id FROM feed_groups WHERE name = ? AND id != ?")?;
@@ -823,7 +822,7 @@ impl StorageManager {
     /// 通过group_id更新订阅源的分组信息
     #[allow(unused)]
     pub async fn update_feed_group(&mut self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         
         // 更新订阅源的group_id
         conn.execute(
@@ -837,7 +836,7 @@ impl StorageManager {
     /// 保存设置
     #[allow(unused)]
     pub async fn save_setting<T: Serialize>(&mut self, key: &str, value: &T) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         let json_value = serde_json::to_string(value)?;
 
         // 使用DuckDB原生的INSERT ON CONFLICT语法
@@ -855,7 +854,7 @@ impl StorageManager {
         &self,
         key: &str,
     ) -> anyhow::Result<Option<T>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
         if let Ok(json_value) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
@@ -902,7 +901,7 @@ impl StorageManager {
     /// 获取所有收藏的文章
     #[allow(unused)]
     pub async fn get_starred_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -943,7 +942,7 @@ impl StorageManager {
     /// 获取所有文章
     #[allow(unused)]
     pub async fn get_all_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1002,7 +1001,7 @@ impl StorageManager {
     /// 搜索文章
     #[allow(unused)]
     pub async fn search_articles(&self, query: &str) -> anyhow::Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let search_pattern = format!("%{}%", query);
         let mut stmt = conn.prepare(
@@ -1116,7 +1115,7 @@ impl StorageManager {
         let groups = self.get_all_groups().await?;
 
         // 获取所有文章
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
              FROM articles"
@@ -1312,40 +1311,49 @@ impl StorageManager {
     }
     
     /// 导出数据为SQL文件，支持DuckDB
+    #[allow(unused)]
     pub async fn export_to_sql(&self, export_path: &PathBuf) -> anyhow::Result<()>
     {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         let mut sql_content = String::new();
         
         // 添加文件头注释
-        sql_content.push_str("-- RSS Rust Reader 数据库导出\n");
+        sql_content.push_str("-- RSS Rust Reader 数据库导出");
+        sql_content.push('\n');
         sql_content.push_str("-- 导出时间: ");
         sql_content.push_str(&chrono::Utc::now().to_rfc3339());
-        sql_content.push_str("\n");
-        sql_content.push_str("-- 支持DuckDB\n\n");
+        sql_content.push('\n');
+        sql_content.push_str("-- 支持DuckDB");
+        sql_content.push('\n');
+        sql_content.push('\n');
         
         // 按依赖关系排序的表名列表
         let tables = ["feed_groups", "feeds", "articles", "settings"];
         
         // 1. 生成表结构创建语句
-        sql_content.push_str("-- 表结构创建语句\n");
+        sql_content.push_str("-- 表结构创建语句");
+        sql_content.push('\n');
         for table in tables.iter() {
             sql_content.push_str(&self.generate_create_table_sql(&conn, table)?);
-            sql_content.push_str("\n");
+            sql_content.push('\n');
         }
         
         // 2. 生成数据插入语句
-        sql_content.push_str("\n-- 数据插入语句\n");
+        sql_content.push('\n');
+        sql_content.push_str("-- 数据插入语句");
+        sql_content.push('\n');
         for table in tables.iter() {
             sql_content.push_str(&self.generate_insert_sql(&conn, table)?);
-            sql_content.push_str("\n");
+            sql_content.push('\n');
         }
         
         // 3. 生成索引创建语句
-        sql_content.push_str("\n-- 索引创建语句\n");
+        sql_content.push('\n');
+        sql_content.push_str("-- 索引创建语句");
+        sql_content.push('\n');
         for table in tables.iter() {
             sql_content.push_str(&self.generate_create_index_sql(&conn, table)?);
-            sql_content.push_str("\n");
+            sql_content.push('\n');
         }
         
         // 写入SQL文件
@@ -1355,12 +1363,13 @@ impl StorageManager {
     }
     
     /// 生成CREATE TABLE语句
+    #[allow(unused)]
     fn generate_create_table_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
     {
         let mut result = String::new();
         
         // 获取表结构信息
-        let schema_sql = format!("SELECT ordinal_position - 1 as cid, 
+        let schema_sql = "SELECT ordinal_position - 1 as cid, 
                                       column_name as name, 
                                       data_type as type, 
                                       CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END as notnull,
@@ -1368,7 +1377,7 @@ impl StorageManager {
                                       CASE WHEN constraint_name = 'PRIMARY' THEN 1 ELSE 0 END as pk
                                FROM information_schema.columns
                                WHERE table_name = ?
-                               ORDER BY ordinal_position");
+                               ORDER BY ordinal_position".to_string();
         let mut stmt = conn.prepare(&schema_sql)?;
         let columns = stmt.query_map([table_name], |row| {
             Ok((
@@ -1425,15 +1434,16 @@ impl StorageManager {
     }
     
     /// 生成INSERT INTO语句
+    #[allow(unused)]
     fn generate_insert_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
     {
         let mut result = String::new();
         
         // 获取表的所有列名
-        let schema_sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position");
+        let schema_sql = "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position".to_string();
         let mut stmt = conn.prepare(&schema_sql)?;
         let columns = stmt.query_map([table_name], |row| {
-            Ok(row.get::<_, String>(0)?) // column_name
+            row.get::<_, String>(0) // column_name
         })?
         .collect::<DuckDBResult<Vec<_>>>()?;
         
@@ -1487,6 +1497,7 @@ impl StorageManager {
     }
     
     /// 生成CREATE INDEX语句
+    #[allow(unused)]
     fn generate_create_index_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
     {
         let mut result = String::new();
@@ -1532,7 +1543,7 @@ impl StorageManager {
             
             let mut columns_stmt = conn.prepare(columns_sql)?;
             let index_columns = columns_stmt.query_map(params![&index_name], |row| {
-                Ok(row.get::<_, String>(0)?) // column_name
+                row.get::<_, String>(0) // column_name
             })?
             .collect::<DuckDBResult<Vec<_>>>()?;
             
@@ -1547,7 +1558,8 @@ impl StorageManager {
         Ok(result)
     }
     
-    /// 转义SQL字符串中的特殊字符
+    /// 转义SQL字符串
+    #[allow(unused)]
     fn escape_sql_string(&self, s: &str) -> String
     {
         s.replace("'", "''")
@@ -1650,7 +1662,7 @@ impl StorageManager {
 
     /// 获取指定订阅源的文章
     pub async fn get_articles_by_feed(&self, feed_id: i64) -> anyhow::Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1713,7 +1725,7 @@ impl StorageManager {
         article_id: i64,
         read: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         conn.execute(
             "UPDATE articles SET is_read = ? WHERE id = ?",
@@ -1730,7 +1742,7 @@ impl StorageManager {
         article_id: i64,
         starred: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         conn.execute(
             "UPDATE articles SET is_starred = ? WHERE id = ?",
@@ -1746,7 +1758,7 @@ impl StorageManager {
         article_id: i64,
         new_content: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         conn.execute(
             "UPDATE articles SET content = ? WHERE id = ?",
@@ -1759,7 +1771,7 @@ impl StorageManager {
     /// 获取所有未读文章数量
     #[allow(unused)]
     pub async fn get_unread_count(&self) -> anyhow::Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE is_read = 0",
@@ -1773,7 +1785,7 @@ impl StorageManager {
     /// 获取指定订阅源的未读文章数量
     #[allow(unused)]
     pub async fn get_feed_unread_count(&self, feed_id: i64) -> anyhow::Result<u32> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE feed_id = ? AND is_read = 0",
@@ -1786,7 +1798,7 @@ impl StorageManager {
 
     /// 获取单个文章
     pub async fn get_article(&self, article_id: i64) -> anyhow::Result<Article> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         let article = conn.query_row(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1823,7 +1835,7 @@ impl StorageManager {
     /// 删除指定订阅源的所有文章
     #[allow(unused)]
     pub async fn delete_feed_articles(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         conn.execute("DELETE FROM articles WHERE feed_id = ? AND is_starred = 0", params![feed_id])?;
 
@@ -1834,7 +1846,7 @@ impl StorageManager {
 
     /// 批量标记文章为已读
     pub async fn mark_all_as_read(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         match feed_id {
             Some(id) => {
@@ -1853,7 +1865,7 @@ impl StorageManager {
 
     /// 批量标记指定ID的文章为已读
     pub async fn mark_articles_as_read(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         for &id in article_ids {
             conn.execute(
                 "UPDATE articles SET is_read = 1 WHERE id = ?",
@@ -1865,7 +1877,7 @@ impl StorageManager {
 
     /// 删除单篇文章
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![article_id])?;
 
@@ -1874,7 +1886,7 @@ impl StorageManager {
 
     /// 批量删除文章
     pub async fn delete_all_articles(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 
         match feed_id {
             Some(id) => {
@@ -1890,7 +1902,7 @@ impl StorageManager {
 
     /// 批量删除指定ID的文章
     pub async fn delete_articles(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
         for &id in article_ids {
             conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![id])?;
         }

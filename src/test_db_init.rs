@@ -3,6 +3,7 @@ use crate::storage::StorageManager;
 use std::path::PathBuf;
 
 // 测试数据库初始化和错误处理
+#[allow(unused)]
 pub fn test_database_initialization() {
     println!("开始测试数据库初始化...");
 
@@ -20,6 +21,7 @@ pub fn test_database_initialization() {
 }
 
 // 测试导出到SQL文件功能
+#[allow(unused)]
 pub async fn test_export_to_sql() {
     println!("开始测试导出到SQL文件功能...");
     // 获取默认数据库路径
