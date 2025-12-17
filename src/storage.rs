@@ -399,7 +399,7 @@ impl StorageManager {
 
     /// 添加新的订阅源
     #[allow(unused)]
-    pub async fn add_feed(&self, feed: Feed) -> anyhow::Result<i64> {
+    pub async fn add_feed(&mut self, feed: Feed) -> anyhow::Result<i64> {
         log::info!("开始添加订阅源，URL: {}", feed.url);
         
         // 获取数据库连接
@@ -566,7 +566,7 @@ impl StorageManager {
     
 
     /// 更新订阅源信息
-    pub async fn update_feed(&self, feed: &Feed) -> anyhow::Result<()> {
+    pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
         let conn = self.get_connection();
         
         // 处理分组逻辑
@@ -622,7 +622,7 @@ impl StorageManager {
     }
 
     /// 更新订阅源最后更新时间
-    pub async fn update_feed_last_updated(&self, feed_id: i64) -> anyhow::Result<()> {
+    pub async fn update_feed_last_updated(&mut self, feed_id: i64) -> anyhow::Result<()> {
         let conn = self.get_connection();
 
         // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
@@ -636,7 +636,7 @@ impl StorageManager {
     }
 
     /// 删除订阅源
-    pub async fn delete_feed(&self, feed_id: i64) -> anyhow::Result<()> {
+    pub async fn delete_feed(&mut self, feed_id: i64) -> anyhow::Result<()> {
         let conn = self.get_connection();
 
         // 先删除相关的文章
@@ -669,7 +669,7 @@ impl StorageManager {
 
     /// 删除分组
     #[allow(unused)]
-    pub async fn delete_group(&self, group_id: i64) -> anyhow::Result<()> {
+    pub async fn delete_group(&mut self, group_id: i64) -> anyhow::Result<()> {
         let mut conn = self.get_connection();
 
         // 开始事务
@@ -692,7 +692,7 @@ impl StorageManager {
 
     /// 添加分组
     #[allow(unused)]
-    pub async fn add_group(&self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
+    pub async fn add_group(&mut self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
         let conn = self.get_connection();
 
         // 验证分组名称不为空
@@ -736,7 +736,7 @@ impl StorageManager {
     /// 更新分组名称
     #[allow(unused)]
     pub async fn update_group_name(
-        &self,
+        &mut self,
         group_id: i64,
         new_name: &str,
     ) -> anyhow::Result<()> {
@@ -756,7 +756,7 @@ impl StorageManager {
     
     /// 通过group_id更新订阅源的分组信息
     #[allow(unused)]
-    pub async fn update_feed_group(&self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
+    pub async fn update_feed_group(&mut self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
         let conn = self.get_connection();
         
         // 更新订阅源的group_id
@@ -770,7 +770,7 @@ impl StorageManager {
 
     /// 保存设置
     #[allow(unused)]
-    pub async fn save_setting<T: Serialize>(&self, key: &str, value: &T) -> anyhow::Result<()> {
+    pub async fn save_setting<T: Serialize>(&mut self, key: &str, value: &T) -> anyhow::Result<()> {
         let conn = self.get_connection();
         let json_value = serde_json::to_string(value)?;
 
@@ -802,7 +802,7 @@ impl StorageManager {
 
     /// 设置自动更新启用状态
     #[allow(unused)]
-    pub async fn set_auto_update_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+    pub async fn set_auto_update_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.save_setting("auto_update_enabled", &enabled).await
     }
 
@@ -822,7 +822,7 @@ impl StorageManager {
 
     /// 设置更新间隔（分钟）
     #[allow(unused)]
-    pub async fn set_update_interval(&self, interval: u64) -> anyhow::Result<()> {
+    pub async fn set_update_interval(&mut self, interval: u64) -> anyhow::Result<()> {
         const SETTING_KEY: &str = "update_interval_minutes";
 
         // 验证间隔值的合理性（1-1440分钟，即1分钟到1天）
@@ -981,7 +981,7 @@ impl StorageManager {
     /// 清理旧文章（保留最近N篇）
     #[allow(unused)]
     pub async fn cleanup_old_articles(
-        &self,
+        &mut self,
         feed_id: i64,
         keep_count: u32,
     ) -> anyhow::Result<()> {
@@ -1123,7 +1123,8 @@ impl StorageManager {
 
     /// 从JSON导入数据
     #[allow(unused)]
-    pub async fn import_data(&self, import_path: &PathBuf) -> anyhow::Result<()> {
+    pub async fn import_data(&mut self, import_path: &PathBuf) -> anyhow::Result<()>
+    {
         let json = std::fs::read_to_string(import_path)?;
 
         #[derive(Deserialize)]
@@ -1520,7 +1521,7 @@ impl StorageManager {
 
     /// 添加文章
     pub async fn add_articles(
-        &self,
+        &mut self,
         feed_id: i64,
         articles: Vec<Article>,
     ) -> anyhow::Result<usize> {

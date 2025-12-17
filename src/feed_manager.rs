@@ -10,14 +10,14 @@ use tokio::sync::Mutex;
 /// RSS源管理器
 pub struct FeedManager {
     /// 存储管理器
-    storage: Arc<StorageManager>,
+    storage: Arc<Mutex<StorageManager>>,
     /// 通知管理器
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
 }
 
 impl FeedManager {
     /// 创建新的RSS源管理器
-    pub fn new(storage: Arc<StorageManager>) -> Self {
+    pub fn new(storage: Arc<Mutex<StorageManager>>) -> Self {
         Self {
             storage,
             notification_manager: None,
@@ -65,7 +65,8 @@ impl FeedManager {
         }
 
         // 保存到数据库
-        let feed_id = self.storage.add_feed(feed.clone()).await?;
+        let mut storage = self.storage.lock().await;
+        let feed_id = storage.add_feed(feed.clone()).await?;
 
         // 设置返回的Feed的ID
         feed.id = feed_id;
@@ -75,14 +76,16 @@ impl FeedManager {
 
     /// 获取所有RSS源
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
-        self.storage.get_all_feeds().await
+        let storage = self.storage.lock().await;
+        storage.get_all_feeds().await
     }
 
     /// 获取分组列表
     #[allow(unused)]
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
+        let storage = self.storage.lock().await;
         // 直接从数据库获取所有分组，包含真实的ID
-        self.storage.get_all_groups().await
+        storage.get_all_groups().await
     }
 
     /// 更新RSS源

@@ -46,7 +46,10 @@ async fn toggle_article_starred_async(
     current_is_read: bool,
 ) -> anyhow::Result<()> {
     // 更新数据库中的收藏状态
-    _storage.update_article_starred_status(article_id, starred).await?;
+    let mut storage = _storage.lock().await;
+    storage
+        .update_article_starred_status(article_id, starred)
+        .await?;
 
     // 发送UI更新消息，使用保存的已读状态
     ui_tx.send(UiMessage::ArticleStatusUpdated(
@@ -71,8 +74,10 @@ async fn update_feed_internal(
     let mut articles = rss_fetcher.fetch_feed(feed_url).await?;
 
     // 获取订阅源信息，检查是否启用AI自动翻译
-    let feeds = _storage.get_all_feeds().await?;
+    let storage_lock = _storage.lock().await;
+    let feeds = storage_lock.get_all_feeds().await?;
     let feed = feeds.into_iter().find(|f| f.id == feed_id);
+    drop(storage_lock); // 提前释放storage锁
 
     // 如果启用了AI自动翻译，并且有AI客户端，则进行翻译
     if let (Some(feed), Some(ai_client)) = (feed, ai_client)
@@ -80,12 +85,14 @@ async fn update_feed_internal(
             log::info!("开始为订阅源 {} 翻译文章", feed.title);
             
             // 先检查哪些文章已经存在于数据库中，避免重复翻译
-            let existing_articles = _storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
+            let storage = _storage.lock().await;
+            let existing_articles = storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
             // 优化：使用&str作为HashSet的键，避免不必要的clone操作
             let existing_guids: std::collections::HashSet<&str> = existing_articles
                 .iter()
                 .map(|article| &article.guid[..])
                 .collect();
+            drop(storage); // 提前释放storage锁
             
             // 过滤出需要翻译的新文章
             let new_articles: Vec<_> = articles
@@ -154,11 +161,12 @@ async fn update_feed_internal(
         }
 
     // 更新订阅源信息和添加文章
-    _storage.update_feed_last_updated(feed_id).await?;
+    let mut storage_lock = _storage.lock().await;
+    storage_lock.update_feed_last_updated(feed_id).await?;
 
     // 批量添加所有获取到的文章，数据库层面会处理重复文章的问题
     if !articles.is_empty() {
-        _storage.add_articles(feed_id, articles).await?;
+        storage_lock.add_articles(feed_id, articles).await?;
     }
 
     Ok(())
@@ -166,19 +174,20 @@ async fn update_feed_internal(
 
 /// 从存储中加载特定订阅源的文章
 pub async fn load_articles_for_feed(
-    storage: Arc<StorageManager>,
+    storage: Arc<Mutex<StorageManager>>,
     feed_id: i64,
 ) -> anyhow::Result<Vec<Article>> {
+    let storage_lock = storage.lock().await;
     // 当选择全部文章时（feed_id = -1），使用get_all_articles而不是get_articles_by_feed
     if feed_id == -1 {
-        storage.get_all_articles().await
+        storage_lock.get_all_articles().await
     } else {
-        storage.get_articles_by_feed(feed_id).await
+        storage_lock.get_articles_by_feed(feed_id).await
     }
 }
 
 pub async fn perform_auto_update(
-    _storage: Arc<StorageManager>,
+    _storage: Arc<Mutex<StorageManager>>,
     rss_fetcher: Arc<RssFetcher>,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Sender<UiMessage>,
@@ -188,7 +197,9 @@ pub async fn perform_auto_update(
     log::info!("开始执行自动更新");
 
     // 获取所有订阅源
-    let feeds = _storage.get_all_feeds().await?;
+    let storage_lock = _storage.lock().await;
+    let feeds = storage_lock.get_all_feeds().await?;
+    drop(storage_lock); // 提前释放锁
 
     log::info!("发现 {} 个订阅源需要更新", feeds.len());
 
@@ -233,7 +244,7 @@ pub async fn perform_auto_update(
             let mut new_article_titles = Vec::new();
 
             // 获取更新前的文章数量
-            let old_articles = match storage_clone.get_articles_by_feed(feed_id).await {
+            let old_articles = match storage_clone.lock().await.get_articles_by_feed(feed_id).await {
                 Ok(articles) => articles,
                 Err(e) => {
                     log::error!("获取订阅源文章失败 (ID: {}): {:?}", feed_id, e);
@@ -254,7 +265,7 @@ pub async fn perform_auto_update(
                 result = Err(e);
             } else {
                 // 获取更新后的文章数量
-                let new_articles = match storage_clone.get_articles_by_feed(feed_id).await {
+                let new_articles = match storage_clone.lock().await.get_articles_by_feed(feed_id).await {
                     Ok(articles) => articles,
                     Err(e) => {
                         log::error!("获取更新后文章失败 (ID: {}): {:?}", feed_id, e);
