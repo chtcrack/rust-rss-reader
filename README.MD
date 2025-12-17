@@ -40,11 +40,10 @@
 - **编程语言**：Rust
 - **GUI框架**：egui
 - **异步运行时**：Tokio
-- **数据库**：SQLite
+- **数据库**：DUCKDB
 - **RSS解析**：rss crate
 - **HTTP客户端**：reqwest
 - **系统托盘**：tray-item
-- **WebView**：web-view
 - **OPML处理**：opml crate
 - **HTML解析**：内置HTML解析功能
 - **AI集成**：自定义AI客户端
