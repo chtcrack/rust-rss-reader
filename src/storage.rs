@@ -2,20 +2,18 @@
 
 use crate::models::{Article, Feed, FeedGroup};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
-
+use duckdb::{Connection, OptionalExt, Result as DuckDBResult, params};
+use duckdb::types::ValueRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use ammonia::{Builder, UrlRelative};
 use html_escape::decode_html_entities;
 
 /// 存储管理器
 pub struct StorageManager {
-    /// 数据库连接
-    connection: Arc<Mutex<Connection>>,
+    /// 数据库路径
+    db_path: String,
 }
 
 impl StorageManager {
@@ -186,23 +184,14 @@ impl StorageManager {
 
     /// 创建新的存储管理器
     pub fn new(db_path: String) -> Self {
-        // 尝试连接数据库，如果失败则尝试创建
-        let conn = match Connection::open(&db_path) {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("警告: 无法打开数据库 {:?}: {}", db_path, e);
-                eprintln!("尝试创建新的数据库文件...");
-                // 确保数据库目录存在
-                if let Some(parent) = PathBuf::from(&db_path).parent()
-                    && let Err(create_err) = std::fs::create_dir_all(parent) {
-                        eprintln!("错误: 无法创建数据库目录: {}", create_err);
-                    }
-                // 再次尝试打开数据库
-                Connection::open(db_path).expect("创建数据库失败")
-            }
-        };
+        // 确保数据库目录存在
+        if let Some(parent) = PathBuf::from(&db_path).parent()
+            && let Err(create_err) = std::fs::create_dir_all(parent) {
+            eprintln!("错误: 无法创建数据库目录: {}", create_err);
+        }
 
-        // 初始化数据库表，添加错误处理
+        // 初始化数据库表
+        let conn = Connection::open(&db_path).expect("创建数据库连接失败");
         match Self::init_database(&conn) {
             Ok(_) => (),
             Err(e) => {
@@ -211,50 +200,51 @@ impl StorageManager {
             }
         }
 
-        // 设置自动VACUUM模式，使SQLite在每次删除提交时自动回收空间
-        if let Err(e) = conn.execute("PRAGMA auto_vacuum = 1;", []) {
-            eprintln!("警告: 无法设置自动VACUUM模式: {}", e);
-        }
-        // 2. 立即执行一次完整VACUUM来回收现有空间
-        if let Err(e) = conn.execute("VACUUM;", []) {
-            eprintln!("警告: 无法执行VACUUM: {}", e);
-        }
-        // 3. 其他优化设置
-        // 使用WAL模式，提高并发性能和崩溃恢复能力
-        let _ = conn.execute("PRAGMA journal_mode = WAL;", []);
-        // 设置synchronous=NORMAL，平衡性能和安全性
-        let _ = conn.execute("PRAGMA synchronous = NORMAL;", []);
-        // 设置WAL自动检查点阈值为1000页，控制WAL文件大小
-        let _ = conn.execute("PRAGMA wal_autocheckpoint = 1000;", []);
-        // 启用WAL校验和，提高数据完整性
-        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", []);
-        // 启用数据完整性检查
-        let _ = conn.execute("PRAGMA integrity_check;", []);
+        // DuckDB不需要SQLite特定的PRAGMA设置
+        // DuckDB会自动管理存储空间，不需要手动执行VACUUM
+        // 移除VACUUM命令以避免资源死锁问题
 
         Self {
-            connection: Arc::new(Mutex::new(conn)),
+            db_path,
         }
     }
 
+    /// 获取新的数据库连接
+    fn get_connection(&self) -> Connection {
+        Connection::open(&self.db_path).expect("获取数据库连接失败")
+    }
+
     /// 初始化数据库表
-    fn init_database(conn: &Connection) -> SqliteResult<()> {
+    fn init_database(conn: &duckdb::Connection) -> DuckDBResult<()> {
+        // 创建订阅源分组表的序列
+        conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS feed_groups_id_seq START 1;",
+            [],
+        )?;
+
         // 创建订阅源分组表
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS feed_groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGINT PRIMARY KEY DEFAULT nextval('feed_groups_id_seq'),
                 name TEXT NOT NULL UNIQUE,
                 icon TEXT
             )"#,
             [],
         )?;
 
+        // 创建订阅源表的序列
+        conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS feeds_id_seq START 1;",
+            [],
+        )?;
+
         // 创建订阅源表
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS feeds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGINT PRIMARY KEY DEFAULT nextval('feeds_id_seq'),
                 title TEXT NOT NULL,
                 url TEXT NOT NULL UNIQUE,
-                group_name TEXT DEFAULT '',
+                group_id BIGINT DEFAULT NULL,
                 last_updated TIMESTAMP,
                 description TEXT,
                 language TEXT,
@@ -268,10 +258,10 @@ impl StorageManager {
         )?;
 
         // 检查并添加auto_update字段（如果不存在）
-        let mut stmt = conn.prepare("PRAGMA table_info(feeds)")?;
+        let mut stmt = conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_name = 'feeds'")?;
         let table_info: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))? // 索引1对应列名
-            .collect::<SqliteResult<_>>()?;
+            .query_map([], |row| row.get::<_, String>(0))? // 索引0对应column_name
+            .collect::<DuckDBResult<_>>()?;
 
         let has_auto_update = table_info.iter().any(|col| col == "auto_update");
         if !has_auto_update {
@@ -303,16 +293,26 @@ impl StorageManager {
         let has_group_id = table_info.iter().any(|col| col == "group_id");
         if !has_group_id {
             conn.execute(
-                "ALTER TABLE feeds ADD COLUMN group_id INTEGER DEFAULT NULL",
+                "ALTER TABLE feeds ADD COLUMN group_id BIGINT DEFAULT NULL",
                 [],
             )?;
+        } else {
+            // 如果group_id字段存在，检查并修改其类型为BIGINT
+            // DuckDB不支持直接修改列类型，所以我们需要重新创建表
+            // 但为了简化，我们先跳过这个检查，因为DuckDB会自动处理类型转换
         }
+
+        // 创建文章表的序列
+        conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS articles_id_seq START 1;",
+            [],
+        )?;
 
         // 创建文章表
         conn.execute(
             r#"CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                feed_id INTEGER NOT NULL,
+                id BIGINT PRIMARY KEY DEFAULT nextval('articles_id_seq'),
+                feed_id BIGINT NOT NULL,
                 title TEXT NOT NULL,
                 link TEXT,
                 author TEXT,
@@ -322,8 +322,7 @@ impl StorageManager {
                 is_read INTEGER DEFAULT 0,
                 is_starred INTEGER DEFAULT 0,
                 source TEXT,
-                guid TEXT,
-                FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+                guid TEXT
             )"#,
             [],
         )?;
@@ -400,100 +399,155 @@ impl StorageManager {
 
     /// 添加新的订阅源
     #[allow(unused)]
-    pub async fn add_feed(&mut self, feed: Feed) -> anyhow::Result<i64> {
-        let mut conn = self.connection.lock().await;
+    pub async fn add_feed(&self, feed: Feed) -> anyhow::Result<i64> {
+        log::info!("开始添加订阅源，URL: {}", feed.url);
+        
+        // 获取数据库连接
+        let mut conn = self.get_connection();
+        log::info!("获取数据库连接成功");
+        
+        // 开始事务，将所有操作放在一个事务中
+        let tx = conn.transaction()?;
+        log::info!("创建事务成功");
         
         // 检查是否已存在相同URL的订阅源
-        { // 新作用域，确保stmt在事务开始前被删除
-            let mut stmt = conn.prepare("SELECT id FROM feeds WHERE url = ?")?;
-            if let Ok(Some(id)) = stmt
-                .query_row(params![&feed.url], |row| row.get(0))
-                .optional()
-            {
-                return Ok(id); // 返回已存在的ID
-            }
-        }
+        log::info!("检查是否已存在相同URL的订阅源");
+        let select_sql = "SELECT id FROM feeds WHERE url = ?";
+        log::info!("执行SQL: {}", select_sql);
         
-        // 开始事务
-        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(select_sql)?;
+        log::info!("准备SELECT语句成功");
+        
+        let query_result = stmt.query_row(params![&feed.url], |row: &duckdb::Row| row.get(0)).optional()?;
+        
+        if let Some(id) = query_result {
+            log::info!("订阅源已存在，返回ID: {}", id);
+            tx.commit()?;
+            return Ok(id); // 返回已存在的ID
+        }
+        log::info!("订阅源不存在，准备添加");
         
         // 处理分组逻辑
         let group_id = if feed.group.is_empty() {
             // 空分组，使用NULL
+            log::info!("订阅源分组为空，使用NULL");
             None
         } else {
-            // 查询是否已存在同名分组
-            let mut group_stmt = tx.prepare("SELECT id FROM feed_groups WHERE name = ?")?;
-            let group_exists = group_stmt
-                .query_row(params![&feed.group], |row| row.get::<_, i64>(0))
-                .optional()?;
+            log::info!("处理订阅源分组: {}", feed.group);
+            // 直接查询分组ID，不使用UPSERT，避免复杂逻辑
+            let select_group_sql = "SELECT id FROM feed_groups WHERE name = ?";
+            log::info!("执行分组查询SQL: {}", select_group_sql);
             
-            if let Some(id) = group_exists {
+            let mut group_stmt = tx.prepare(select_group_sql)?;
+            let group_query_result = group_stmt.query_row(params![&feed.group], |row: &duckdb::Row| row.get::<_, i64>(0)).optional()?;
+            
+            if let Some(id) = group_query_result {
+                log::info!("分组已存在，获取到分组ID: {}", id);
                 Some(id)
             } else {
-                // 不存在，插入新分组
-                tx.execute(
-                    "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
-                    params![feed.group, None::<&str>],
-                )?;
+                log::info!("分组不存在，准备插入新分组");
+                // 插入新分组
+                let insert_group_sql = "INSERT INTO feed_groups (name, icon) VALUES (?, ?)";
+                log::info!("执行插入分组SQL: {}", insert_group_sql);
                 
-                // 获取插入的ID或已存在的ID
+                tx.execute(insert_group_sql, params![feed.group, None::<Option<&str>>])?;
+                
+                log::info!("插入分组成功，准备获取新分组ID");
+                // 获取插入的ID
                 let new_group_id = tx.query_row(
-                    "SELECT id FROM feed_groups WHERE name = ?",
+                    select_group_sql,
                     params![&feed.group],
-                    |row| row.get::<_, i64>(0),
+                    |row: &duckdb::Row| row.get::<_, i64>(0)
                 )?;
                 
+                log::info!("获取到新分组ID: {}", new_group_id);
                 Some(new_group_id)
             }
         };
 
         // 添加新订阅源，包含last_updated字段
-        let _result = tx.execute(
-            "INSERT INTO feeds (title, url, group_id, description, language, link, favicon, last_updated, auto_update, enable_notification, ai_auto_translate) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        let last_updated = feed.last_updated.unwrap_or_else(chrono::Utc::now);
+        log::info!("准备插入新订阅源，last_updated: {:?}", last_updated);
+        
+        // 插入新订阅源，直接包含group_id字段
+        let insert_sql = "INSERT INTO feeds (title, url, group_id, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id";
+        log::info!("执行插入订阅源SQL: {}", insert_sql);
+        log::info!("插入参数: title={}, url={}, group_id={:?}", feed.title, feed.url, group_id);
+        
+        let id = tx.query_row(
+            insert_sql,
             params![
                 feed.title,
                 feed.url,
                 group_id,
+                last_updated,
                 feed.description,
                 feed.language,
                 feed.link,
                 feed.favicon,
-                feed.last_updated.unwrap_or_else(chrono::Utc::now), // 使用当前时间作为默认值
                 feed.auto_update as i8,
                 feed.enable_notification as i8,
                 feed.ai_auto_translate as i8
             ],
+            |row: &duckdb::Row| row.get::<_, i64>(0)
         )?;
-
-        // 获取插入的ID
-        let id = tx.last_insert_rowid();
+        
+        log::info!("插入订阅源成功，返回ID: {}", id);
         
         // 提交事务
+        log::info!("提交事务");
         tx.commit()?;
+        
+        log::info!("添加订阅源成功，返回ID: {}", id);
 
         Ok(id)
     }
 
     /// 获取所有订阅源
     pub async fn get_all_feeds(&self) -> anyhow::Result<Vec<Feed>> {
-        let conn = self.connection.lock().await;
+        // 获取新的数据库连接
+        let conn = self.get_connection();
 
+        // 使用更简单的查询，避免复杂的JOIN和COALESCE
+        // 直接获取订阅源和分组信息，DuckDB应该能正确处理
         let mut stmt = conn.prepare(
-            "SELECT f.id, f.title, f.url, COALESCE(g.name, '') as group_name, f.group_id, f.last_updated, f.description, f.language, f.link, f.favicon, f.auto_update, f.enable_notification, f.ai_auto_translate 
-             FROM feeds f LEFT JOIN feed_groups g ON f.group_id = g.id ORDER BY g.name, f.title"
+            "SELECT f.id, f.title, f.url, f.group_id, g.name, f.last_updated, f.description, f.language, f.link, f.favicon, f.auto_update, f.enable_notification, f.ai_auto_translate 
+             FROM feeds f LEFT JOIN feed_groups g ON f.group_id = g.id ORDER BY f.title"
         )?;
 
         let feeds = stmt
             .query_map([], |row| {
+                // 获取last_updated字段，处理NULL值并从字符串解析为DateTime<Utc>
+                let last_updated_str: Option<String> = row.get(5)?;
+                let last_updated = match last_updated_str {
+                    Some(s) => {
+                        // 尝试多种时间格式解析
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+                            Some(dt.with_timezone(&chrono::Utc))
+                        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&s) {
+                            Some(dt.with_timezone(&chrono::Utc))
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S.%f") {
+                            // 支持ISO格式：2025-12-16 03:45:35.063049
+                            Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
+                            // 支持ISO格式：2025-12-16 03:45:35
+                            Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
+                        } else {
+                            // 所有解析尝试都失败，使用当前时间作为默认值
+                            log::warn!("无法解析last_updated: {}, 使用当前时间作为默认值", s);
+                            Some(chrono::Utc::now())
+                        }
+                    },
+                    None => None,
+                };
+                
                 Ok(Feed {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     url: row.get(2)?,
-                    group: row.get(3)?,
-                    group_id: row.get(4)?,
-                    last_updated: row.get(5)?,
+                    group: row.get(4).unwrap_or_default(),
+                    group_id: row.get(3)?,
+                    last_updated,
                     description: row.get(6)?,
                     language: row.get(7)?,
                     link: row.get(8)?,
@@ -503,116 +557,17 @@ impl StorageManager {
                     ai_auto_translate: row.get(12)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<Feed>>>()?;
+            .collect::<DuckDBResult<Vec<Feed>>>()?;
 
         Ok(feeds)
     }
 
-    /// 执行数据迁移，将group_name映射为group_id
-    pub async fn migrate_feed_group_ids(&mut self) -> anyhow::Result<()> {
-        let mut conn = self.connection.lock().await;
-        
-        // 开始事务
-        let tx = conn.transaction()?;
-        
-        // 1. 首先获取feeds表中所有唯一的group_name值
-        let unique_group_names = {
-            let mut stmt = tx.prepare("SELECT DISTINCT group_name FROM feeds WHERE group_name != ''")?;
-            stmt
-                .query_map([], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<rusqlite::Result<Vec<String>>>()?
-        };
-        
-        // 2. 确保feed_groups表中存在所有这些分组
-        let mut group_name_to_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        
-        // 先获取现有的分组
-        let existing_groups = {
-            let mut stmt = tx.prepare("SELECT id, name FROM feed_groups")?;
-            stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<(i64, String)>>>()?
-        };
-        
-        // 添加到映射表
-        for (id, name) in existing_groups {
-            group_name_to_id.insert(name, id);
-        }
-        
-        // 3. 为不存在的分组创建记录
-        for group_name in &unique_group_names {
-            if !group_name_to_id.contains_key(group_name) && !group_name.is_empty() {
-                // 插入新分组
-                tx.execute(
-                    "INSERT INTO feed_groups (name) VALUES (?)",
-                    params![group_name],
-                )?;
-                
-                // 获取插入的ID
-                let group_id = tx.last_insert_rowid();
-                
-                // 添加到映射表
-                group_name_to_id.insert(group_name.to_string(), group_id); // 转换为String类型，无需clone
-            }
-        }
-        
-        // 4. 遍历所有订阅源，更新group_id
-        let feeds = {
-            let mut feed_stmt = tx.prepare("SELECT id, group_name FROM feeds WHERE group_id IS NULL OR group_id = 0")?;
-            feed_stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<(i64, String)>>>()?
-        };
-        
-        for (feed_id, group_name) in feeds {
-            if let Some(group_id) = group_name_to_id.get(&group_name) {
-                // 更新feed的group_id
-                tx.execute(
-                    "UPDATE feeds SET group_id = ? WHERE id = ?",
-                    params![group_id, feed_id],
-                )?;
-            }
-        }
-        
-        // 提交事务
-        tx.commit()?;
-        
-        Ok(())
-    }
+  
     
-    /// 清理工作：移除feeds表中的group_name字段
-    pub async fn cleanup_group_name_field(&mut self) -> anyhow::Result<()> {
-        let  conn = self.connection.lock().await;
-        
-        // 检查group_name字段是否存在
-        let mut stmt = conn.prepare("PRAGMA table_info(feeds)")?;
-        let table_info: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<_>>()?;
-        
-        if table_info.contains(&"group_name".to_string()) {
-            // 移除group_name字段
-            conn.execute("ALTER TABLE feeds DROP COLUMN group_name", [])?;
-            log::info!("成功移除feeds表中的group_name字段");
-        } else {
-            log::info!("feeds表中不存在group_name字段，无需移除");
-        }
-        
-        Ok(())
-    }
 
     /// 更新订阅源信息
-    pub async fn update_feed(&mut self, feed: &Feed) -> anyhow::Result<()> {
-        let mut conn = self.connection.lock().await;
-        
-        // 开始事务
-        let tx = conn.transaction()?;
+    pub async fn update_feed(&self, feed: &Feed) -> anyhow::Result<()> {
+        let conn = self.get_connection();
         
         // 处理分组逻辑
         let group_id = if feed.group.is_empty() {
@@ -620,7 +575,7 @@ impl StorageManager {
             None
         } else {
             // 查询是否已存在同名分组
-            let mut group_stmt = tx.prepare("SELECT id FROM feed_groups WHERE name = ?")?;
+            let mut group_stmt = conn.prepare("SELECT id FROM feed_groups WHERE name = ?")?;
             let group_exists = group_stmt
                 .query_row(params![&feed.group], |row| row.get::<_, i64>(0))
                 .optional()?;
@@ -629,13 +584,13 @@ impl StorageManager {
                 Some(id)
             } else {
                 // 不存在，插入新分组
-                tx.execute(
-                    "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
+                conn.execute(
+                    "INSERT INTO feed_groups (name, icon) VALUES (?, ?)",
                     params![feed.group, None::<&str>],
                 )?;
                 
-                // 获取插入的ID或已存在的ID
-                let new_group_id = tx.query_row(
+                // 获取插入的ID
+                let new_group_id = conn.query_row(
                     "SELECT id FROM feed_groups WHERE name = ?",
                     params![&feed.group],
                     |row| row.get::<_, i64>(0),
@@ -645,7 +600,7 @@ impl StorageManager {
             }
         };
 
-        tx.execute(
+        conn.execute(
             "UPDATE feeds SET title = ?, url = ?, group_id = ?, description = ?, 
              language = ?, link = ?, favicon = ?, auto_update = ?, enable_notification = ?, ai_auto_translate = ? WHERE id = ?",
             params![
@@ -662,29 +617,32 @@ impl StorageManager {
                 feed.id
             ],
         )?;
-        
-        // 提交事务
-        tx.commit()?;
 
         Ok(())
     }
 
     /// 更新订阅源最后更新时间
-    pub async fn update_feed_last_updated(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+    pub async fn update_feed_last_updated(&self, feed_id: i64) -> anyhow::Result<()> {
+        let conn = self.get_connection();
 
+        // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
+        let now = Utc::now();
         conn.execute(
             "UPDATE feeds SET last_updated = ? WHERE id = ?",
-            params![Utc::now(), feed_id],
+            params![now, feed_id],
         )?;
 
         Ok(())
     }
 
     /// 删除订阅源
-    pub async fn delete_feed(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+    pub async fn delete_feed(&self, feed_id: i64) -> anyhow::Result<()> {
+        let conn = self.get_connection();
 
+        // 先删除相关的文章
+        conn.execute("DELETE FROM articles WHERE feed_id = ?", params![feed_id])?;
+        
+        // 再删除订阅源
         conn.execute("DELETE FROM feeds WHERE id = ?", params![feed_id])?;
 
         Ok(())
@@ -692,7 +650,7 @@ impl StorageManager {
 
     /// 获取所有订阅源分组
     pub async fn get_all_groups(&self) -> anyhow::Result<Vec<FeedGroup>> {
-        let conn = self.connection.lock().await;
+          let conn = self.get_connection();
 
         let mut stmt = conn.prepare("SELECT id, name, icon FROM feed_groups ORDER BY name")?;
 
@@ -704,64 +662,87 @@ impl StorageManager {
                     icon: row.get(2)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<FeedGroup>>>()?;
+            .collect::<DuckDBResult<Vec<FeedGroup>>>()?;
 
         Ok(groups)
     }
 
     /// 删除分组
     #[allow(unused)]
-    pub async fn delete_group(&mut self, group_id: i64) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+    pub async fn delete_group(&self, group_id: i64) -> anyhow::Result<()> {
+        let mut conn = self.get_connection();
 
+        // 开始事务
+        let tx = conn.transaction()?;
+        
         // 先将使用此分组的订阅源的group_id设为NULL
-        conn.execute(
+        tx.execute(
             "UPDATE feeds SET group_id = NULL WHERE group_id = ?",
             params![group_id],
         )?;
 
         // 删除分组
-        conn.execute("DELETE FROM feed_groups WHERE id = ?", params![group_id])?;
+        tx.execute("DELETE FROM feed_groups WHERE id = ?", params![group_id])?;
+        
+        // 提交事务
+        tx.commit()?;
 
         Ok(())
     }
 
     /// 添加分组
     #[allow(unused)]
-    pub async fn add_group(&mut self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
-        let conn = self.connection.lock().await;
+    pub async fn add_group(&self, group_name: &str, icon: Option<&str>) -> anyhow::Result<i64> {
+        let conn = self.get_connection();
 
         // 验证分组名称不为空
         if group_name.trim().is_empty() {
             return Err(anyhow::anyhow!("分组名称不能为空"));
         }
 
-        // 插入分组，使用INSERT OR IGNORE避免重复
-        conn.execute(
-            "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
-            params![group_name.trim(), icon],
-        )?;
+        let trimmed_name = group_name.trim();
+        
+        // 先检查分组是否已存在
+        let group_exists = conn
+            .query_row(
+                "SELECT id FROM feed_groups WHERE name = ?",
+                params![trimmed_name],
+                |row| row.get::<_, i64>(0)
+            )
+            .optional()?;
+        
+        if let Some(id) = group_exists {
+            // 分组已存在，直接返回ID
+            Ok(id)
+        } else {
+            // 分组不存在，插入新分组
+            // 使用DuckDB兼容的INSERT语法，不使用INSERT OR IGNORE
+            conn.execute(
+                "INSERT INTO feed_groups (name, icon) VALUES (?, ?)",
+                params![trimmed_name, icon],
+            )?;
 
-        // 获取插入的ID或已存在的ID
-        let group_id = conn.query_row(
-            "SELECT id FROM feed_groups WHERE name = ?",
-            params![group_name.trim()],
-            |row| row.get(0),
-        )?;
+            // 获取插入的ID
+            let group_id = conn.query_row(
+                "SELECT id FROM feed_groups WHERE name = ?",
+                params![trimmed_name],
+                |row| row.get(0),
+            )?;
 
-        Ok(group_id)
+            Ok(group_id)
+        }
     }
 
     /// 更新分组名称
     #[allow(unused)]
     pub async fn update_group_name(
-        &mut self,
+        &self,
         group_id: i64,
         new_name: &str,
     ) -> anyhow::Result<()> {
         log::debug!("[update_group_name] 开始执行，group_id: {}, new_name: '{}'", group_id, new_name);
         
-      let conn = self.connection.lock().await;
+        let conn = self.get_connection();
         
         // 更新订阅源的group_id
         conn.execute(
@@ -775,8 +756,8 @@ impl StorageManager {
     
     /// 通过group_id更新订阅源的分组信息
     #[allow(unused)]
-    pub async fn update_feed_group(&mut self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+    pub async fn update_feed_group(&self, feed_id: i64, group_id: Option<i64>) -> anyhow::Result<()> {
+        let conn = self.get_connection();
         
         // 更新订阅源的group_id
         conn.execute(
@@ -789,13 +770,13 @@ impl StorageManager {
 
     /// 保存设置
     #[allow(unused)]
-    pub async fn save_setting<T: Serialize>(&mut self, key: &str, value: &T) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+    pub async fn save_setting<T: Serialize>(&self, key: &str, value: &T) -> anyhow::Result<()> {
+        let conn = self.get_connection();
         let json_value = serde_json::to_string(value)?;
 
-        // 使用INSERT OR REPLACE
+        // 使用DuckDB原生的INSERT ON CONFLICT语法
         conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![key, json_value],
         )?;
 
@@ -808,7 +789,7 @@ impl StorageManager {
         &self,
         key: &str,
     ) -> anyhow::Result<Option<T>> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
         if let Ok(json_value) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
@@ -821,7 +802,7 @@ impl StorageManager {
 
     /// 设置自动更新启用状态
     #[allow(unused)]
-    pub async fn set_auto_update_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
+    pub async fn set_auto_update_enabled(&self, enabled: bool) -> anyhow::Result<()> {
         self.save_setting("auto_update_enabled", &enabled).await
     }
 
@@ -841,7 +822,7 @@ impl StorageManager {
 
     /// 设置更新间隔（分钟）
     #[allow(unused)]
-    pub async fn set_update_interval(&mut self, interval: u64) -> anyhow::Result<()> {
+    pub async fn set_update_interval(&self, interval: u64) -> anyhow::Result<()> {
         const SETTING_KEY: &str = "update_interval_minutes";
 
         // 验证间隔值的合理性（1-1440分钟，即1分钟到1天）
@@ -855,7 +836,7 @@ impl StorageManager {
     /// 获取所有收藏的文章
     #[allow(unused)]
     pub async fn get_starred_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -864,13 +845,20 @@ impl StorageManager {
 
         let articles = stmt
             .query_map([], |row| {
+                // 获取pub_date字段，从字符串解析为DateTime<Utc>
+                let pub_date_str: String = row.get(5)?;
+                let pub_date = match chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(e) => return Err(duckdb::Error::ToSqlConversionFailure(Box::new(e))),
+                };
+                
                 Ok(Article {
                     id: row.get(0)?,
                     feed_id: row.get(1)?,
                     title: row.get(2)?,
                     link: row.get(3)?,
                     author: row.get(4)?,
-                    pub_date: row.get(5)?,
+                    pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
                     is_read: row.get::<_, i32>(8)? == 1,
@@ -881,7 +869,7 @@ impl StorageManager {
                         .unwrap_or_else(|_| row.get::<_, String>(3).unwrap_or_default()),
                 })
             })?
-            .collect::<rusqlite::Result<Vec<Article>>>()?;
+            .collect::<DuckDBResult<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -889,7 +877,7 @@ impl StorageManager {
     /// 获取所有文章
     #[allow(unused)]
     pub async fn get_all_articles(&self) -> anyhow::Result<Vec<Article>> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -898,13 +886,40 @@ impl StorageManager {
 
         let articles = stmt
             .query_map([], |row| {
+                // 获取pub_date字段，从字符串解析为DateTime<Utc>，增强容错性
+                let pub_date = match row.get::<_, Option<String>>(5)? {
+                    Some(pub_date_str) => {
+                        // 尝试多种时间格式解析
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                            dt.with_timezone(&chrono::Utc)
+                        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&pub_date_str) {
+                            dt.with_timezone(&chrono::Utc)
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&pub_date_str, "%Y-%m-%d %H:%M:%S.%f") {
+                            // 支持ISO格式：2025-12-16 03:45:35.063049
+                            chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&pub_date_str, "%Y-%m-%d %H:%M:%S") {
+                            // 支持ISO格式：2025-12-16 03:45:35
+                            chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)
+                        } else {
+                            // 所有解析尝试都失败，使用当前时间作为默认值
+                            log::warn!("无法解析pub_date: {}, 使用当前时间作为默认值", pub_date_str);
+                            chrono::Utc::now()
+                        }
+                    },
+                    None => {
+                        // 数据库中为NULL，使用当前时间作为默认值
+                        log::warn!("pub_date为NULL，使用当前时间作为默认值");
+                        chrono::Utc::now()
+                    }
+                };
+                
                 Ok(Article {
                     id: row.get(0)?,
                     feed_id: row.get(1)?,
                     title: row.get(2)?,
                     link: row.get(3)?,
                     author: row.get(4)?,
-                    pub_date: row.get(5)?,
+                    pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
                     is_read: row.get::<_, i32>(8)? == 1,
@@ -913,7 +928,7 @@ impl StorageManager {
                     guid: row.get(11)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<Article>>>()?;
+            .collect::<DuckDBResult<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -921,7 +936,7 @@ impl StorageManager {
     /// 搜索文章
     #[allow(unused)]
     pub async fn search_articles(&self, query: &str) -> anyhow::Result<Vec<Article>> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let search_pattern = format!("%{}%", query);
         let mut stmt = conn.prepare(
@@ -935,13 +950,20 @@ impl StorageManager {
             .query_map(
                 params![&search_pattern, &search_pattern, &search_pattern],
                 |row| {
+                    // 获取pub_date字段，从字符串解析为DateTime<Utc>
+                    let pub_date_str: String = row.get(5)?;
+                    let pub_date = match chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                        Ok(dt) => dt.with_timezone(&chrono::Utc),
+                        Err(e) => return Err(duckdb::Error::ToSqlConversionFailure(Box::new(e))),
+                    };
+                    
                     Ok(Article {
                         id: row.get(0)?,
                         feed_id: row.get(1)?,
                         title: row.get(2)?,
                         link: row.get(3)?,
                         author: row.get(4)?,
-                        pub_date: row.get(5)?,
+                        pub_date,
                         content: row.get(6)?,
                         summary: row.get(7)?,
                         is_read: row.get::<_, i32>(8)? == 1,
@@ -951,7 +973,7 @@ impl StorageManager {
                     })
                 },
             )?
-            .collect::<rusqlite::Result<Vec<Article>>>()?;
+            .collect::<DuckDBResult<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -959,11 +981,11 @@ impl StorageManager {
     /// 清理旧文章（保留最近N篇）
     #[allow(unused)]
     pub async fn cleanup_old_articles(
-        &mut self,
+        &self,
         feed_id: i64,
         keep_count: u32,
     ) -> anyhow::Result<()> {
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.get_connection();
         let tx = conn.transaction()?;
 
         // 简化删除逻辑，直接使用feed_id和LIMIT
@@ -1038,12 +1060,13 @@ impl StorageManager {
 
     /// 导出数据为JSON
     #[allow(unused)]
-    pub async fn export_data(&self, export_path: &PathBuf) -> anyhow::Result<()> {
+    pub async fn export_data(&self, export_path: &PathBuf) -> anyhow::Result<()>
+    {
         let feeds = self.get_all_feeds().await?;
         let groups = self.get_all_groups().await?;
 
         // 获取所有文章
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
              FROM articles"
@@ -1051,13 +1074,20 @@ impl StorageManager {
 
         let articles = stmt
             .query_map([], |row| {
+                // 获取pub_date字段，从字符串解析为DateTime<Utc>
+                let pub_date_str: String = row.get(5)?;
+                let pub_date = match chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(e) => return Err(duckdb::Error::ToSqlConversionFailure(Box::new(e))),
+                };
+                
                 Ok(Article {
                     id: row.get(0)?,
                     feed_id: row.get(1)?,
                     title: row.get(2)?,
                     link: row.get(3)?,
                     author: row.get(4)?,
-                    pub_date: row.get(5)?,
+                    pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
                     is_read: row.get::<_, i32>(8)? == 1,
@@ -1066,7 +1096,7 @@ impl StorageManager {
                     guid: row.get(11)?,
                 })
             })?
-            .collect::<SqliteResult<Vec<Article>>>()?;
+            .collect::<DuckDBResult<Vec<Article>>>()?;
 
         // 构建导出数据结构
         #[derive(Serialize)]
@@ -1093,7 +1123,7 @@ impl StorageManager {
 
     /// 从JSON导入数据
     #[allow(unused)]
-    pub async fn import_data(&mut self, import_path: &PathBuf) -> anyhow::Result<()> {
+    pub async fn import_data(&self, import_path: &PathBuf) -> anyhow::Result<()> {
         let json = std::fs::read_to_string(import_path)?;
 
         #[derive(Deserialize)]
@@ -1104,43 +1134,84 @@ impl StorageManager {
         }
 
         let import_data: ImportData = serde_json::from_str(&json)?;
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.get_connection();
         let tx = conn.transaction()?;
 
         // 导入分组
         for group in import_data.groups {
-            tx.execute(
-                "INSERT OR IGNORE INTO feed_groups (name, icon) VALUES (?, ?)",
-                params![group.name, group.icon],
-            )?;
+            // 先检查分组是否已存在
+            let group_exists = tx
+                .query_row(
+                    "SELECT id FROM feed_groups WHERE name = ?",
+                    params![group.name],
+                    |row| row.get::<_, i64>(0)
+                )
+                .optional()?;
+            
+            if group_exists.is_none() {
+                // 分组不存在，插入新分组
+                tx.execute(
+                    "INSERT INTO feed_groups (name, icon) VALUES (?, ?)",
+                    params![group.name, group.icon],
+                )?;
+            }
         }
 
         // 导入订阅源
         let mut feed_id_map = std::collections::HashMap::new();
         for feed in import_data.feeds {
-            // 插入或更新订阅源
-            tx.execute(
-                "INSERT OR REPLACE INTO feeds 
-                 (title, url, group_name, group_id, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    feed.title,
-                    feed.url,
-                    feed.group,
-                    feed.group_id,
-                    feed.last_updated,
-                    feed.description,
-                    feed.language,
-                    feed.link,
-                    feed.favicon,
-                    feed.auto_update as i8,
-                    feed.enable_notification as i8,
-                    feed.ai_auto_translate as i8
-                ],
-            )?;
+            // 检查订阅源是否已存在
+            let feed_exists = tx
+                .query_row(
+                    "SELECT id FROM feeds WHERE url = ?",
+                    params![feed.url],
+                    |row| row.get::<_, i64>(0)
+                )
+                .optional()?;
+            
+            let new_id = if let Some(existing_id) = feed_exists {
+                // 订阅源已存在，更新记录
+                            tx.execute(
+                                "UPDATE feeds SET title = ?, group_id = ?, last_updated = ?, description = ?, language = ?, link = ?, favicon = ?, auto_update = ?, enable_notification = ?, ai_auto_translate = ? WHERE url = ?",
+                                params![
+                                    feed.title,
+                                    feed.group_id,
+                                    feed.last_updated,
+                                    feed.description,
+                                    feed.language,
+                                    feed.link,
+                                    feed.favicon,
+                                    feed.auto_update as i8,
+                                    feed.enable_notification as i8,
+                                    feed.ai_auto_translate as i8,
+                                    feed.url
+                                ],
+                            )?;
+                            existing_id
+                        } else {
+                            // 订阅源不存在，插入新记录，使用RETURNING子句获取ID
+                            tx.query_row(
+                                "INSERT INTO feeds (title, url, group_id, last_updated, description, language, link, favicon, auto_update, enable_notification, ai_auto_translate) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 
+                                 RETURNING id",
+                                params![
+                                    feed.title,
+                                    feed.url,
+                                    feed.group_id,
+                                    feed.last_updated,
+                                    feed.description,
+                                    feed.language,
+                                    feed.link,
+                                    feed.favicon,
+                                    feed.auto_update as i8,
+                                    feed.enable_notification as i8,
+                                    feed.ai_auto_translate as i8
+                                ],
+                                |row| row.get::<_, i64>(0)
+                            )?
+                        };
 
             // 获取新的ID并建立映射
-            let new_id = tx.last_insert_rowid();
             feed_id_map.insert(feed.id, new_id);
         }
 
@@ -1152,30 +1223,289 @@ impl StorageManager {
                 .copied()
                 .unwrap_or(article.feed_id);
 
-            tx.execute(
-                "INSERT OR IGNORE INTO articles 
-                 (feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    new_feed_id,
-                    article.title,
-                    article.link,
-                    article.author,
-                    article.pub_date,
-                    article.content,
-                    article.summary,
-                    article.is_read as i32,
-                    article.is_starred as i32,
-                    article.source,
-                    article.guid,
-                ],
-            )?;
+            // 先检查文章是否已存在
+            let article_exists = tx
+                .query_row(
+                    "SELECT id FROM articles WHERE guid = ?",
+                    params![article.guid],
+                    |row| row.get::<_, i64>(0)
+                )
+                .optional()?;
+            
+            if article_exists.is_none() {
+                // 文章不存在，插入新文章
+                // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
+                tx.execute(
+                    "INSERT INTO articles 
+                     (feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        new_feed_id,
+                        article.title,
+                        article.link,
+                        article.author,
+                        article.pub_date,
+                        article.content,
+                        article.summary,
+                        article.is_read as i32,
+                        article.is_starred as i32,
+                        article.source,
+                        article.guid,
+                    ],
+                )?;
+            }
         }
 
         tx.commit()?;
         Ok(())
     }
-
+    
+    /// 导出数据为SQL文件，支持DuckDB
+    pub async fn export_to_sql(&self, export_path: &PathBuf) -> anyhow::Result<()>
+    {
+        let conn = self.get_connection();
+        let mut sql_content = String::new();
+        
+        // 添加文件头注释
+        sql_content.push_str("-- RSS Rust Reader 数据库导出\n");
+        sql_content.push_str("-- 导出时间: ");
+        sql_content.push_str(&chrono::Utc::now().to_rfc3339());
+        sql_content.push_str("\n");
+        sql_content.push_str("-- 支持DuckDB\n\n");
+        
+        // 按依赖关系排序的表名列表
+        let tables = ["feed_groups", "feeds", "articles", "settings"];
+        
+        // 1. 生成表结构创建语句
+        sql_content.push_str("-- 表结构创建语句\n");
+        for table in tables.iter() {
+            sql_content.push_str(&self.generate_create_table_sql(&conn, table)?);
+            sql_content.push_str("\n");
+        }
+        
+        // 2. 生成数据插入语句
+        sql_content.push_str("\n-- 数据插入语句\n");
+        for table in tables.iter() {
+            sql_content.push_str(&self.generate_insert_sql(&conn, table)?);
+            sql_content.push_str("\n");
+        }
+        
+        // 3. 生成索引创建语句
+        sql_content.push_str("\n-- 索引创建语句\n");
+        for table in tables.iter() {
+            sql_content.push_str(&self.generate_create_index_sql(&conn, table)?);
+            sql_content.push_str("\n");
+        }
+        
+        // 写入SQL文件
+        std::fs::write(export_path, sql_content)?;
+        
+        Ok(())
+    }
+    
+    /// 生成CREATE TABLE语句
+    fn generate_create_table_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
+    {
+        let mut result = String::new();
+        
+        // 获取表结构信息
+        let schema_sql = format!("SELECT ordinal_position - 1 as cid, 
+                                      column_name as name, 
+                                      data_type as type, 
+                                      CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END as notnull,
+                                      column_default as dflt_value,
+                                      CASE WHEN constraint_name = 'PRIMARY' THEN 1 ELSE 0 END as pk
+                               FROM information_schema.columns
+                               WHERE table_name = ?
+                               ORDER BY ordinal_position");
+        let mut stmt = conn.prepare(&schema_sql)?;
+        let columns = stmt.query_map([table_name], |row| {
+            Ok((
+                row.get::<_, i32>(0)?, // cid
+                row.get::<_, String>(1)?, // name
+                row.get::<_, String>(2)?, // type
+                row.get::<_, i32>(3)?, // notnull
+                row.get::<_, Option<String>>(4)?, // dflt_value
+                row.get::<_, i32>(5)?, // pk
+            ))
+        })?
+        .collect::<DuckDBResult<Vec<_>>>()?;
+        
+        // 生成CREATE TABLE语句
+        result.push_str(&format!("CREATE TABLE IF NOT EXISTS {table_name} (\n"));
+        
+        let mut column_defs = Vec::new();
+        for (_cid, name, type_, notnull, dflt_value, pk) in columns {
+            let mut col_def = format!("    {name} {type_}");
+            
+            // 处理主键
+            if pk == 1 {
+                col_def.push_str(" PRIMARY KEY");
+                // DuckDB支持AUTOINCREMENT，但语法略有不同
+                if type_ == "INTEGER" {
+                    col_def.push_str(" AUTOINCREMENT");
+                }
+            }
+            
+            // 处理NOT NULL约束
+            if notnull == 1 && pk == 0 {
+                col_def.push_str(" NOT NULL");
+            }
+            
+            // 处理默认值
+            if let Some(default) = dflt_value {
+                col_def.push_str(&format!(" DEFAULT {default}"));
+            }
+            
+            column_defs.push(col_def);
+        }
+        
+        // 处理外键约束
+        if table_name == "feeds" {
+            column_defs.push("    FOREIGN KEY (group_id) REFERENCES feed_groups(id) ON DELETE SET NULL".to_string());
+        } else if table_name == "articles" {
+            column_defs.push("    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE".to_string());
+        }
+        
+        result.push_str(&column_defs.join(",\n"));
+        result.push_str("\n);");
+        
+        Ok(result)
+    }
+    
+    /// 生成INSERT INTO语句
+    fn generate_insert_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
+    {
+        let mut result = String::new();
+        
+        // 获取表的所有列名
+        let schema_sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position");
+        let mut stmt = conn.prepare(&schema_sql)?;
+        let columns = stmt.query_map([table_name], |row| {
+            Ok(row.get::<_, String>(0)?) // column_name
+        })?
+        .collect::<DuckDBResult<Vec<_>>>()?;
+        
+        // 构建SELECT语句
+        let select_sql = format!("SELECT {} FROM {}", columns.join(", "), table_name);
+        let mut stmt = conn.prepare(&select_sql)?;
+        
+        // 生成INSERT语句
+        let columns_str = columns.join(", ");
+        result.push_str(&format!("-- 插入 {} 表数据\n", table_name));
+        
+        // 遍历所有行
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let mut values_str = Vec::new();
+            
+            // 遍历所有列
+            for i in 0..columns.len() {
+                // 使用ValueRef动态获取值类型
+                let value_ref = row.get_ref(i)?;
+                
+                let value_str = match value_ref {
+                    ValueRef::Null => "NULL".to_string(),
+                    ValueRef::BigInt(i) => i.to_string(),
+                    ValueRef::Double(r) => r.to_string(),
+                    ValueRef::Text(t) => {
+                        let s = String::from_utf8_lossy(t).to_string();
+                        let escaped = self.escape_sql_string(&s);
+                        format!("'{}'", escaped)
+                    },
+                    ValueRef::Blob(b) => {
+                        let s = String::from_utf8_lossy(b).to_string();
+                        let escaped = self.escape_sql_string(&s);
+                        format!("'{}'", escaped)
+                    },
+                    _ => "NULL".to_string(), // 处理其他类型
+                };
+                
+                values_str.push(value_str);
+            }
+            
+            result.push_str(&format!("INSERT INTO {table_name} ({columns_str}) VALUES ({})\n", values_str.join(", ")));
+        }
+        
+        // 如果没有生成任何INSERT语句，说明没有数据
+        if result == format!("-- 插入 {} 表数据\n", table_name) {
+            return Ok(String::new());
+        }
+        
+        Ok(result)
+    }
+    
+    /// 生成CREATE INDEX语句
+    fn generate_create_index_sql(&self, conn: &Connection, table_name: &str) -> anyhow::Result<String>
+    {
+        let mut result = String::new();
+        
+        // 使用DuckDB兼容的方式获取索引信息，不使用SQLite特定的PRAGMA
+        let indexes_sql = "
+            SELECT 
+                i.index_name,
+                i.is_unique
+            FROM 
+                information_schema.columns c
+            JOIN 
+                information_schema.indexes i ON c.table_name = i.table_name AND c.table_schema = i.table_schema
+            WHERE 
+                c.table_name = ?
+            GROUP BY 
+                i.index_name, i.is_unique
+        ";
+        
+        let mut stmt = conn.prepare(indexes_sql)?;
+        let indexes = stmt.query_map(params![table_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?, // index_name
+                row.get::<_, bool>(1)?, // is_unique
+            ))
+        })?
+        .collect::<DuckDBResult<Vec<_>>>()?;
+        
+        for (index_name, is_unique) in indexes {
+            // 使用DuckDB兼容的方式获取索引列信息
+            let columns_sql = "
+                SELECT 
+                    c.column_name
+                FROM 
+                    information_schema.columns c
+                JOIN 
+                    information_schema.indexes i ON c.table_name = i.table_name AND c.table_schema = i.table_schema
+                WHERE 
+                    i.index_name = ?
+                ORDER BY 
+                    i.ordinal_position
+            ";
+            
+            let mut columns_stmt = conn.prepare(columns_sql)?;
+            let index_columns = columns_stmt.query_map(params![&index_name], |row| {
+                Ok(row.get::<_, String>(0)?) // column_name
+            })?
+            .collect::<DuckDBResult<Vec<_>>>()?;
+            
+            let columns_str = index_columns.join(", ");
+            
+            // 生成CREATE INDEX语句
+            let unique_str = if is_unique { "UNIQUE " } else { "" };
+            result.push_str(&format!("CREATE {}INDEX IF NOT EXISTS {} ON {} ({})\n", 
+                unique_str, index_name, table_name, columns_str));
+        }
+        
+        Ok(result)
+    }
+    
+    /// 转义SQL字符串中的特殊字符
+    fn escape_sql_string(&self, s: &str) -> String
+    {
+        s.replace("'", "''")
+         .replace("\"", "\\\"")
+         .replace("\n", "\\n")
+         .replace("\r", "\\r")
+         .replace("\t", "\\t")
+    }
+    
     /// 辅助函数：移除URL中的锚点部分
     fn remove_url_anchor(url: &str) -> String {
         // 查找#字符的位置
@@ -1190,11 +1520,11 @@ impl StorageManager {
 
     /// 添加文章
     pub async fn add_articles(
-        &mut self,
+        &self,
         feed_id: i64,
         articles: Vec<Article>,
     ) -> anyhow::Result<usize> {
-        let mut conn = self.connection.lock().await;
+        let mut conn = self.get_connection();
         let tx = conn.transaction()?;
         let mut new_articles_count = 0;
 
@@ -1226,9 +1556,10 @@ impl StorageManager {
                 let cleaned_summary = Self::sanitize_html(&article.summary);
                 let cleaned_title = decode_html_entities(&article.title).to_string();
                 
-                // 添加新文章，使用INSERT OR IGNORE避免唯一约束错误
+                // 添加新文章，使用INSERT，因为已经确保了不会插入重复的文章
+                // 直接使用chrono::DateTime类型，DuckDB驱动支持chrono特性
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO articles (feed_id, title, link, author, pub_date, content, 
+                    "INSERT INTO articles (feed_id, title, link, author, pub_date, content, 
                      summary, is_read, is_starred, source, guid) 
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
@@ -1259,7 +1590,7 @@ impl StorageManager {
 
     /// 获取指定订阅源的文章
     pub async fn get_articles_by_feed(&self, feed_id: i64) -> anyhow::Result<Vec<Article>> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let mut stmt = conn.prepare(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
@@ -1268,13 +1599,40 @@ impl StorageManager {
 
         let articles = stmt
             .query_map(params![feed_id], |row| {
+                // 获取pub_date字段，从字符串解析为DateTime<Utc>，增强容错性
+                let pub_date = match row.get::<_, Option<String>>(5)? {
+                    Some(pub_date_str) => {
+                        // 尝试多种时间格式解析
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                            dt.with_timezone(&chrono::Utc)
+                        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(&pub_date_str) {
+                            dt.with_timezone(&chrono::Utc)
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&pub_date_str, "%Y-%m-%d %H:%M:%S.%f") {
+                            // 支持ISO格式：2025-12-16 03:45:35.063049
+                            chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&pub_date_str, "%Y-%m-%d %H:%M:%S") {
+                            // 支持ISO格式：2025-12-16 03:45:35
+                            chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)
+                        } else {
+                            // 所有解析尝试都失败，使用当前时间作为默认值
+                            log::warn!("无法解析pub_date: {}, 使用当前时间作为默认值", pub_date_str);
+                            chrono::Utc::now()
+                        }
+                    },
+                    None => {
+                        // 数据库中为NULL，使用当前时间作为默认值
+                        log::warn!("pub_date为NULL，使用当前时间作为默认值");
+                        chrono::Utc::now()
+                    }
+                };
+                
                 Ok(Article {
                     id: row.get(0)?,
                     feed_id: row.get(1)?,
                     title: row.get(2)?,
                     link: row.get(3)?,
                     author: row.get(4)?,
-                    pub_date: row.get(5)?,
+                    pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
                     is_read: row.get::<_, i32>(8)? == 1,
@@ -1283,7 +1641,7 @@ impl StorageManager {
                     guid: row.get(11)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<Article>>>()?;
+            .collect::<DuckDBResult<Vec<Article>>>()?;
 
         Ok(articles)
     }
@@ -1295,7 +1653,7 @@ impl StorageManager {
         article_id: i64,
         read: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         conn.execute(
             "UPDATE articles SET is_read = ? WHERE id = ?",
@@ -1312,7 +1670,7 @@ impl StorageManager {
         article_id: i64,
         starred: bool,
     ) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         conn.execute(
             "UPDATE articles SET is_starred = ? WHERE id = ?",
@@ -1328,7 +1686,7 @@ impl StorageManager {
         article_id: i64,
         new_content: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         conn.execute(
             "UPDATE articles SET content = ? WHERE id = ?",
@@ -1341,7 +1699,7 @@ impl StorageManager {
     /// 获取所有未读文章数量
     #[allow(unused)]
     pub async fn get_unread_count(&self) -> anyhow::Result<u32> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE is_read = 0",
@@ -1355,7 +1713,7 @@ impl StorageManager {
     /// 获取指定订阅源的未读文章数量
     #[allow(unused)]
     pub async fn get_feed_unread_count(&self, feed_id: i64) -> anyhow::Result<u32> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM articles WHERE feed_id = ? AND is_read = 0",
@@ -1368,20 +1726,27 @@ impl StorageManager {
 
     /// 获取单个文章
     pub async fn get_article(&self, article_id: i64) -> anyhow::Result<Article> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         let article = conn.query_row(
             "SELECT id, feed_id, title, link, author, pub_date, content, summary, is_read, is_starred, source, guid 
              FROM articles WHERE id = ?",
             params![article_id],
             |row| {
+                // 获取pub_date字段，从字符串解析为DateTime<Utc>
+                let pub_date_str: String = row.get(5)?;
+                let pub_date = match chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
+                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                    Err(e) => return Err(duckdb::Error::ToSqlConversionFailure(Box::new(e))),
+                };
+                
                 Ok(Article {
                     id: row.get(0)?,
                     feed_id: row.get(1)?,
                     title: row.get(2)?,
                     link: row.get(3)?,
                     author: row.get(4)?,
-                    pub_date: row.get(5)?,
+                    pub_date,
                     content: row.get(6)?,
                     summary: row.get(7)?,
                     is_read: row.get::<_, i32>(8)? == 1,
@@ -1398,7 +1763,7 @@ impl StorageManager {
     /// 删除指定订阅源的所有文章
     #[allow(unused)]
     pub async fn delete_feed_articles(&mut self, feed_id: i64) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         conn.execute("DELETE FROM articles WHERE feed_id = ? AND is_starred = 0", params![feed_id])?;
 
@@ -1409,7 +1774,7 @@ impl StorageManager {
 
     /// 批量标记文章为已读
     pub async fn mark_all_as_read(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         match feed_id {
             Some(id) => {
@@ -1428,7 +1793,7 @@ impl StorageManager {
 
     /// 批量标记指定ID的文章为已读
     pub async fn mark_articles_as_read(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
         for &id in article_ids {
             conn.execute(
                 "UPDATE articles SET is_read = 1 WHERE id = ?",
@@ -1440,7 +1805,7 @@ impl StorageManager {
 
     /// 删除单篇文章
     pub async fn delete_article(&mut self, article_id: i64) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![article_id])?;
 
@@ -1449,7 +1814,7 @@ impl StorageManager {
 
     /// 批量删除文章
     pub async fn delete_all_articles(&mut self, feed_id: Option<i64>) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
 
         match feed_id {
             Some(id) => {
@@ -1465,7 +1830,7 @@ impl StorageManager {
 
     /// 批量删除指定ID的文章
     pub async fn delete_articles(&mut self, article_ids: &[i64]) -> anyhow::Result<()> {
-        let conn = self.connection.lock().await;
+        let conn = self.get_connection();
         for &id in article_ids {
             conn.execute("DELETE FROM articles WHERE id = ? AND is_starred = 0", params![id])?;
         }

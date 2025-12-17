@@ -46,10 +46,7 @@ async fn toggle_article_starred_async(
     current_is_read: bool,
 ) -> anyhow::Result<()> {
     // 更新数据库中的收藏状态
-    let mut storage = _storage.lock().await;
-    storage
-        .update_article_starred_status(article_id, starred)
-        .await?;
+    _storage.update_article_starred_status(article_id, starred).await?;
 
     // 发送UI更新消息，使用保存的已读状态
     ui_tx.send(UiMessage::ArticleStatusUpdated(
@@ -67,19 +64,15 @@ async fn update_feed_internal(
     feed_id: i64,
     feed_url: &str,
     _storage: Arc<Mutex<StorageManager>>,
-    rss_fetcher: Arc<Mutex<RssFetcher>>,
+    rss_fetcher: Arc<RssFetcher>,
     ai_client: Option<Arc<crate::ai_client::AIClient>>,
 ) -> anyhow::Result<()> {
     // 获取RSS内容
-    let fetcher = rss_fetcher.lock().await;
-    let mut articles = fetcher.fetch_feed(feed_url).await?;
-    drop(fetcher); // 提前释放fetcher锁
+    let mut articles = rss_fetcher.fetch_feed(feed_url).await?;
 
     // 获取订阅源信息，检查是否启用AI自动翻译
-    let storage_lock = _storage.lock().await;
-    let feeds = storage_lock.get_all_feeds().await?;
+    let feeds = _storage.get_all_feeds().await?;
     let feed = feeds.into_iter().find(|f| f.id == feed_id);
-    drop(storage_lock); // 提前释放storage锁
 
     // 如果启用了AI自动翻译，并且有AI客户端，则进行翻译
     if let (Some(feed), Some(ai_client)) = (feed, ai_client)
@@ -87,14 +80,12 @@ async fn update_feed_internal(
             log::info!("开始为订阅源 {} 翻译文章", feed.title);
             
             // 先检查哪些文章已经存在于数据库中，避免重复翻译
-            let storage = _storage.lock().await;
-            let existing_articles = storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
+            let existing_articles = _storage.get_articles_by_feed(feed_id).await.unwrap_or_default();
             // 优化：使用&str作为HashSet的键，避免不必要的clone操作
             let existing_guids: std::collections::HashSet<&str> = existing_articles
                 .iter()
                 .map(|article| &article.guid[..])
                 .collect();
-            drop(storage); // 提前释放storage锁
             
             // 过滤出需要翻译的新文章
             let new_articles: Vec<_> = articles
@@ -163,12 +154,11 @@ async fn update_feed_internal(
         }
 
     // 更新订阅源信息和添加文章
-    let mut storage_lock = _storage.lock().await;
-    storage_lock.update_feed_last_updated(feed_id).await?;
+    _storage.update_feed_last_updated(feed_id).await?;
 
     // 批量添加所有获取到的文章，数据库层面会处理重复文章的问题
     if !articles.is_empty() {
-        storage_lock.add_articles(feed_id, articles).await?;
+        _storage.add_articles(feed_id, articles).await?;
     }
 
     Ok(())
@@ -176,21 +166,20 @@ async fn update_feed_internal(
 
 /// 从存储中加载特定订阅源的文章
 pub async fn load_articles_for_feed(
-    storage: Arc<Mutex<StorageManager>>,
+    storage: Arc<StorageManager>,
     feed_id: i64,
 ) -> anyhow::Result<Vec<Article>> {
-    let storage_lock = storage.lock().await;
     // 当选择全部文章时（feed_id = -1），使用get_all_articles而不是get_articles_by_feed
     if feed_id == -1 {
-        storage_lock.get_all_articles().await
+        storage.get_all_articles().await
     } else {
-        storage_lock.get_articles_by_feed(feed_id).await
+        storage.get_articles_by_feed(feed_id).await
     }
 }
 
 pub async fn perform_auto_update(
-    _storage: Arc<Mutex<StorageManager>>,
-    rss_fetcher: Arc<Mutex<RssFetcher>>,
+    _storage: Arc<StorageManager>,
+    rss_fetcher: Arc<RssFetcher>,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Sender<UiMessage>,
     search_manager: Option<Arc<Mutex<SearchManager>>>,
@@ -199,115 +188,155 @@ pub async fn perform_auto_update(
     log::info!("开始执行自动更新");
 
     // 获取所有订阅源
-    let storage_lock = _storage.lock().await;
-    let feeds = storage_lock.get_all_feeds().await?;
-    drop(storage_lock); // 提前释放锁
+    let feeds = _storage.get_all_feeds().await?;
 
     log::info!("发现 {} 个订阅源需要更新", feeds.len());
+
+    // 计算并发线程数：CPU核心数/2，至少为1
+    let num_cpus = num_cpus::get();
+    let concurrency = std::cmp::max(1, num_cpus / 2);
+    log::info!("使用 {} 个并发线程更新订阅源", concurrency);
 
     let mut updated_count = 0;
     let mut error_count = 0;
 
-    // 逐个更新订阅源并检查新文章
-    for feed in feeds {
-        // 检查是否需要自动更新
-        if !feed.auto_update {
-            log::info!(
-                "跳过订阅源 (ID: {}, URL: {}), 自动更新已禁用",
-                feed.id,
-                feed.url
-            );
-            continue;
-        }
+    // 创建并发控制信号量
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    
+    // 创建JoinSet来管理异步任务
+    let mut join_set = tokio::task::JoinSet::new();
+    
+    // 筛选需要更新的订阅源
+    let feeds_to_update: Vec<_> = feeds
+        .into_iter()
+        .filter(|feed| feed.auto_update)
+        .collect();
+    
+    // 为每个订阅源创建异步任务
+    for feed in feeds_to_update {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let storage_clone = _storage.clone();
+        let rss_fetcher_clone = rss_fetcher.clone();
+        let ai_client_clone = ai_client.clone();
+        let search_manager_clone = search_manager.clone();
+        let feed_url = feed.url.clone();
+        let feed_title = feed.title.clone();
+        let feed_id = feed.id;
+        let enable_notification = feed.enable_notification;
 
-        // 获取更新前的文章数量
-        let storage_lock = _storage.lock().await;
-        let old_articles = storage_lock.get_articles_by_feed(feed.id).await?;
-        let old_article_count = old_articles.len();
-        drop(storage_lock); // 提前释放锁
+        // 创建异步任务
+        join_set.spawn(async move {
+            // 释放信号量
+            let _permit = permit;
+            
+            let mut result = Ok(());
+            let mut new_article_titles = Vec::new();
 
-        // 更新订阅源
-        if let Err(e) =
-            update_feed_internal(feed.id, &feed.url, _storage.clone(), rss_fetcher.clone(), ai_client.clone()).await
-        {
-            log::error!(
-                "更新订阅源失败 (ID: {}, URL: {}): {:?}",
-                feed.id,
-                feed.url,
-                e
-            );
-            error_count += 1;
-        } else {
-            updated_count += 1;
-
-            // 获取更新后的文章数量
-            let storage_lock = _storage.lock().await;
-            let new_articles = storage_lock.get_articles_by_feed(feed.id).await?;
-            let current_article_count = new_articles.len();
-
-            // 检查是否有新文章
-            if current_article_count > old_article_count {
-                // 获取真正的新文章
-                let added_articles = article_processor::get_new_articles(&old_articles, &new_articles);
-                let new_count = added_articles.len();
-                
-                // 初始化新文章标题向量
-                let mut new_article_titles = Vec::new();
-                
-                if new_count > 0 {
-                    log::info!("订阅源 {} 有 {} 篇新文章", feed.title, new_count);
-
-                    // 按发布时间倒序排列，取最新的文章
-                    let mut sorted_articles = added_articles; // 直接使用，无需clone
-                    sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
-
-                    // 将所有新文章标题添加到通知列表
-                    for article in sorted_articles.iter() {
-                        new_article_titles.push(article.title.clone());
-                    }
+            // 获取更新前的文章数量
+            let old_articles = match storage_clone.get_articles_by_feed(feed_id).await {
+                Ok(articles) => articles,
+                Err(e) => {
+                    log::error!("获取订阅源文章失败 (ID: {}): {:?}", feed_id, e);
+                    return (feed_id, result, new_article_titles, feed_title, enable_notification);
                 }
-                
-                // 提前释放存储锁
-                drop(storage_lock);
+            };
+            let old_article_count = old_articles.len();
 
-                // 如果有搜索管理器，异步更新搜索索引
-                if let Some(search_mgr) = search_manager.as_ref() {
-                    // 加载配置，判断是否需要更新搜索索引
-                    let config = crate::config::AppConfig::load_or_default();
-                    if config.search_mode == "index_search" {
-                        // 克隆必要的数据以在异步任务中使用
-                        let search_mgr_clone = search_mgr.clone();
+            // 更新订阅源
+            if let Err(e) = update_feed_internal(feed_id, &feed_url, storage_clone.clone(), rss_fetcher_clone, ai_client_clone).await
+            {
+                log::error!(
+                    "更新订阅源失败 (ID: {}, URL: {}): {:?}",
+                    feed_id,
+                    feed_url,
+                    e
+                );
+                result = Err(e);
+            } else {
+                // 获取更新后的文章数量
+                let new_articles = match storage_clone.get_articles_by_feed(feed_id).await {
+                    Ok(articles) => articles,
+                    Err(e) => {
+                        log::error!("获取更新后文章失败 (ID: {}): {:?}", feed_id, e);
+                        return (feed_id, result, new_article_titles, feed_title, enable_notification);
+                    }
+                };
+                let current_article_count = new_articles.len();
 
-                        // 筛选出新增的文章（按发布时间倒序，取最新的new_count篇）
-                        let mut sorted_articles = new_articles; // 直接使用，无需clone
+                // 检查是否有新文章
+                if current_article_count > old_article_count {
+                    // 获取真正的新文章
+                    let added_articles = article_processor::get_new_articles(&old_articles, &new_articles);
+                    let new_count = added_articles.len();
+                    
+                    if new_count > 0 {
+                        log::info!("订阅源 {} 有 {} 篇新文章", feed_title, new_count);
+
+                        // 按发布时间倒序排列，取最新的文章
+                        let mut sorted_articles = added_articles;
                         sorted_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
-                        let added_articles: Vec<Article> = 
-                            sorted_articles.into_iter().take(new_count).collect();
 
-                        // 使用tokio::spawn异步更新搜索索引，避免阻塞主流程
-                            tokio::spawn(async move {
-                                if !added_articles.is_empty() {
-                                    log::info!(
-                                        "正在更新搜索索引，添加 {} 篇新文章",
-                                        added_articles.len()
-                                    );
-                                    let search_lock = search_mgr_clone.lock().await;
-                                    // add_articles返回()而不是Result
-                                    search_lock.add_articles(added_articles).await;
-                                    log::info!("搜索索引更新完成");
-                                }
-                            });
+                        // 将所有新文章标题添加到通知列表
+                        for article in sorted_articles.iter() {
+                            new_article_titles.push(article.title.clone());
+                        }
+
+                        // 如果有搜索管理器，异步更新搜索索引
+                        if let Some(search_mgr) = search_manager_clone.as_ref() {
+                            // 加载配置，判断是否需要更新搜索索引
+                            let config = crate::config::AppConfig::load_or_default();
+                            if config.search_mode == "index_search" {
+                                // 克隆必要的数据以在异步任务中使用
+                                let search_mgr_clone = search_mgr.clone();
+                                
+                                // 筛选出新增的文章
+                                let mut sorted_new_articles = new_articles;
+                                sorted_new_articles.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
+                                let added_articles: Vec<Article> = 
+                                    sorted_new_articles.into_iter().take(new_count).collect();
+
+                                // 使用tokio::spawn异步更新搜索索引
+                                tokio::spawn(async move {
+                                    if !added_articles.is_empty() {
+                                        log::info!(
+                                            "正在更新搜索索引，添加 {} 篇新文章",
+                                            added_articles.len()
+                                        );
+                                        let search_lock = search_mgr_clone.lock().await;
+                                        search_lock.add_articles(added_articles).await;
+                                        log::info!("搜索索引更新完成");
+                                    }
+                                });
+                            }
                         }
                     }
+                }
+            }
 
-                    // 使用封装的通知函数发送新文章通知，只在启用通知时发送
+            (feed_id, result, new_article_titles, feed_title, enable_notification)
+        });
+    }
+
+    // 收集任务结果
+    while let Some(result) = join_set.join_next().await {
+        let (_feed_id, task_result, new_article_titles, feed_title, enable_notification) = result?;
+
+        match task_result {
+            Ok(_) => {
+                updated_count += 1;
+                // 发送新文章通知
+                if !new_article_titles.is_empty() {
                     article_processor::send_new_articles_notification(
                         notification_manager.clone(),
-                        &feed.title,
+                        &feed_title,
                         &new_article_titles,
-                        feed.enable_notification,
+                        enable_notification,
                     );
                 }
+            }
+            Err(_) => {
+                error_count += 1;
+            }
         }
     }
 
@@ -339,7 +368,7 @@ async fn add_feed_async(
     auto_update: bool, // 添加自动更新参数
     ai_auto_translate: bool, // 添加AI自动翻译参数
     _storage: Arc<Mutex<StorageManager>>,
-    rss_fetcher: Arc<Mutex<RssFetcher>>,
+    rss_fetcher: Arc<RssFetcher>,
     _feed_manager: Arc<Mutex<FeedManager>>,
     ui_tx: Sender<UiMessage>, // 添加UI消息通道参数
 ) -> anyhow::Result<()> {
@@ -351,9 +380,7 @@ async fn add_feed_async(
     let url = Url::parse(&feed_url)?;
 
     // 获取RSS内容
-    let fetcher = rss_fetcher.lock().await;
-    let articles = fetcher.fetch_feed(url.as_str()).await?;
-    drop(fetcher); // 提前释放fetcher锁
+    let articles = rss_fetcher.fetch_feed(url.as_str()).await?;
 
     // 创建新的订阅源
     let new_feed = Feed {
@@ -378,8 +405,6 @@ async fn add_feed_async(
 
     // 保存文章
     if !articles.is_empty() {
-        let mut articles_to_save = articles;
-        
         // 获取AI自动翻译设置，避免再次访问new_feed
 
         
@@ -398,12 +423,12 @@ async fn add_feed_async(
             
             if let Ok(ai_client) = ai_client {
                 // 使用独立线程执行翻译，避免阻塞主线程
-                // 优化：使用clone，因为后面还需要使用articles_to_save
-                let articles_to_translate = articles_to_save.clone();
+                // 优化：直接使用articles，不再克隆
+                // 因为后面不再使用原始的articles
                 let translated_articles = tokio::spawn(async move {
                     let mut translated_articles = Vec::new();
                     
-                    for article in articles_to_translate {
+                    for article in articles {
                         // 检测文章标题语言
                         let lang_result = ai_client.detect_language(&article.title).await;
                         
@@ -455,16 +480,24 @@ async fn add_feed_async(
                 }).await;
                 
                 // 使用翻译后的文章
-                if let Ok(translated) = translated_articles {
-                    articles_to_save = translated;
+                if let Ok(translated) = translated_articles
+                    && !translated.is_empty() {
+                    let new_articles_count = storage.add_articles(feed_id, translated).await?;
+                    log::info!("成功保存 {} 篇文章", new_articles_count);
+                }
+            } else {
+                // 如果AI客户端创建失败，直接保存原始文章
+                if !articles.is_empty() {
+                    let new_articles_count = storage.add_articles(feed_id, articles).await?;
+                    log::info!("成功保存 {} 篇文章", new_articles_count);
                 }
             }
-        }
-        
-        let _article_count = articles_to_save.len();
-        // 尝试批量保存文章
-        if let Ok(new_articles_count) = storage.add_articles(feed_id, articles_to_save).await {
-            log::info!("成功保存 {} 篇文章", new_articles_count);
+        } else {
+            // 如果没有启用AI自动翻译，直接保存原始文章
+            if !articles.is_empty() {
+                let new_articles_count = storage.add_articles(feed_id, articles).await?;
+                log::info!("成功保存 {} 篇文章", new_articles_count);
+            }
         }
     }
 
@@ -724,7 +757,7 @@ pub struct App {
     storage: Arc<Mutex<StorageManager>>,
 
     // RSS获取器
-    rss_fetcher: Arc<Mutex<RssFetcher>>,
+    rss_fetcher: Arc<RssFetcher>,
 
     // 订阅源管理器
     feed_manager: Arc<Mutex<FeedManager>>,
@@ -917,7 +950,7 @@ impl App {
         )));
 
         // 初始化RSS获取器
-        let rss_fetcher = Arc::new(Mutex::new(RssFetcher::new(config.user_agent.clone())));
+    let rss_fetcher = Arc::new(RssFetcher::new(config.user_agent.clone()));
 
         // 初始化订阅源管理器
         let feed_manager = Arc::new(Mutex::new(FeedManager::new(storage.clone())));
@@ -1174,20 +1207,14 @@ impl App {
     /// 启动托盘消息处理线程
     fn start_tray_message_thread(&mut self) {
         // 如果没有托盘接收器，直接返回
-        let tray_receiver = self.tray_receiver.take();
-        if tray_receiver.is_none() {
-            return;
-        }
-        
-        // 启动新线程处理托盘消息
-        let thread_handle = std::thread::spawn(move || {
-            log::info!("托盘消息处理线程已启动");
-            
-            let receiver = tray_receiver.unwrap_or_else(|| panic!("托盘接收器不可用，这是一个内部错误"));
-            
-            // 持续处理托盘消息
-            loop {
-                match receiver.recv() {
+        if let Some(tray_receiver) = self.tray_receiver.take() {
+            // 启动新线程处理托盘消息
+            let thread_handle = std::thread::spawn(move || {
+                log::info!("托盘消息处理线程已启动");
+                
+                // 持续处理托盘消息
+                loop {
+                    match tray_receiver.recv() {
                     Ok(msg) => {
                         log::info!("收到托盘消息: {:?}", msg);
                         
@@ -1288,6 +1315,7 @@ impl App {
         // 保存线程句柄
         self.tray_thread_handle = Some(thread_handle);
     }
+}
     
     /// 检查并处理窗口可见性变化
     /// 当窗口从不可见变为可见时，重新加载文章数据以确保用户看到最新内容
@@ -1416,21 +1444,8 @@ impl App {
             log::debug!("获取存储管理器的锁（加载数据）");
             let mut storage_lock = storage.lock().await;
             
-            // 执行数据迁移，将group_name映射为group_id
-            log::debug!("执行数据迁移，将group_name映射为group_id");
-            if let Err(e) = storage_lock.migrate_feed_group_ids().await {
-                log::debug!("数据迁移失败: {}", e);
-            } else {
-                log::info!("数据迁移成功完成");
-                
-                // 清理feeds表中的group_name字段
-                log::debug!("清理feeds表中的group_name字段");
-                if let Err(e) = storage_lock.cleanup_group_name_field().await {
-                    log::error!("清理group_name字段失败: {}", e);
-                } else {
-                    log::info!("清理group_name字段成功");
-                }
-            }
+            // 数据迁移逻辑已集成到init_database和feed操作方法中，无需单独执行
+            log::debug!("数据迁移逻辑已集成，跳过单独迁移步骤");
             log::debug!("成功获取存储管理器的锁");
 
             // 加载所有订阅源
@@ -3248,7 +3263,7 @@ impl eframe::App for App {
 
                     for feed in feeds {
                         // 获取订阅源内容
-                        let articles = match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
+                        let articles = match rss_fetcher.fetch_feed(&feed.url).await {
                             Ok(articles) => articles,
                             Err(e) => {
                                 log::error!("Failed to fetch feed {}: {}", feed.title, e);
@@ -3419,7 +3434,7 @@ impl eframe::App for App {
                                 let old_article_count = old_articles.len();
                                 
                                 // 获取订阅源内容
-                                match rss_fetcher.lock().await.fetch_feed(&feed.url).await {
+                                match rss_fetcher.fetch_feed(&feed.url).await {
                                     Ok(articles) => {
                                         // 存储文章
                                         if let Err(e) = storage.lock().await.add_articles(feed.id, articles).await {
@@ -4876,7 +4891,7 @@ impl eframe::App for App {
                                     log::info!("开始使用Headless Chrome加载网页内容: {}", article_link);
                                     
                                     // 使用Headless Chrome获取网页内容
-                                    match rss_fetcher.lock().await.fetch_web_content(&article_link).await {
+                                    match rss_fetcher.fetch_web_content(&article_link).await {
                                         Ok(html_content) => {
                                             log::info!("成功获取网页内容，长度: {} bytes", html_content.len());
                                             
@@ -4970,7 +4985,12 @@ impl eframe::App for App {
                                     web_content.clone()
                                 } else if self.show_translated_content && self.translated_article.is_some() {
                                     // 使用翻译后的内容
-                                    self.translated_article.as_ref().unwrap().1.clone()
+                                    if let Some((_, translated_content)) = &self.translated_article {
+                                        translated_content.clone()
+                                    } else {
+                                        // 理论上不会执行到这里，因为前面已经检查了is_some()
+                                        article.content.clone()
+                                    }
                                 } else {
                                     // 使用原始内容
                                     article.content.clone()
@@ -5679,7 +5699,7 @@ impl eframe::App for App {
 /// 刷新单个订阅源的异步辅助函数
 async fn refresh_single_feed_async(
     storage: Arc<Mutex<StorageManager>>,
-    rss_fetcher: Arc<Mutex<RssFetcher>>,
+    rss_fetcher: Arc<RssFetcher>,
     feed_id: i64,
     notification_manager: Option<Arc<Mutex<NotificationManager>>>,
     ui_tx: Option<Sender<UiMessage>>,

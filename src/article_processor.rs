@@ -48,20 +48,20 @@ pub fn send_new_articles_notification(
         // 克隆必要的数据以在异步任务中使用
         let notif_manager_clone = notif_manager.clone();
         let feed_title_str = feed_title.to_string();
-        let titles_clone = new_article_titles.to_vec();
+        // 优化：将new_article_titles转换为Vec<String>，使其拥有所有权，以便在异步任务中使用
+        let new_article_titles_owned = new_article_titles.to_vec();
 
         // 使用tokio::spawn异步发送通知，避免阻塞主流程
         tokio::spawn(async move {
-            // 创建文章对象列表 - 优化：使用Vec::with_capacity预分配空间
-            let mut feed_articles = Vec::with_capacity(titles_clone.len());
-            
-            for title in titles_clone.iter() {
-                feed_articles.push((
-                    feed_title_str.clone(), // 此处仍需克隆，因为每个元组需要独立所有权
+            // 创建文章对象列表 - 优化：直接通过迭代创建，避免多次clone feed_title_str
+            // 注意：notify_new_articles方法期望的是Vec<(String, Article)>，所以需要将&str转换为String  
+            let feed_articles = new_article_titles_owned.iter().map(|title| {
+                (
+                    feed_title_str.clone(), // 需要克隆，因为方法期望String类型
                     Article {
                         id: 0,
                         feed_id: 0,
-                        title: title.clone(),
+                        title: title.clone(), // 此处仍需克隆，因为需要转移所有权到Article对象
                         link: "".to_string(),
                         author: "".to_string(),
                         pub_date: chrono::Utc::now(),
@@ -72,8 +72,8 @@ pub fn send_new_articles_notification(
                         source: "".to_string(),
                         guid: "".to_string(),
                     },
-                ));
-            }
+                )
+            }).collect::<Vec<_>>();
 
             notif_manager_clone
                 .lock()
@@ -100,29 +100,16 @@ pub fn direct_search_articles(query: &str, articles: &[Article], feed_id: i64) -
             continue;
         }
 
-        // 优化：避免创建大字符串，分别检查各个字段
+        // 优化：避免创建大字符串，直接在原字符串上检查
+        // 使用as_str()和to_lowercase()的组合，但只在需要时创建小写字符串
         // 优先检查短字段，提高匹配效率
-        let title_lower = article.title.to_lowercase();
-        if title_lower.contains(&query) {
-            results.push(article.clone());
-            continue;
-        }
+        let matched = article.title.to_lowercase().contains(&query)
+            || article.author.to_lowercase().contains(&query)
+            || article.summary.to_lowercase().contains(&query)
+            || article.content.to_lowercase().contains(&query);
         
-        let author_lower = article.author.to_lowercase();
-        if author_lower.contains(&query) {
-            results.push(article.clone());
-            continue;
-        }
-        
-        let summary_lower = article.summary.to_lowercase();
-        if summary_lower.contains(&query) {
-            results.push(article.clone());
-            continue;
-        }
-        
-        // 最后检查可能较大的content字段
-        let content_lower = article.content.to_lowercase();
-        if content_lower.contains(&query) {
+        // 只有在匹配时才克隆文章，避免不必要的克隆操作
+        if matched {
             results.push(article.clone());
         }
     }

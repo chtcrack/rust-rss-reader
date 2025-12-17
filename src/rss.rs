@@ -282,6 +282,12 @@ impl RssFetcher {
         // 对于成功状态，读取字节
         let body = response.bytes().await?;
 
+        // 添加内容完整性检查
+        if body.is_empty() {
+            log::error!("Response body is empty for URL: {}", url);
+            return Err(RssError::NetworkError("服务器返回空内容".to_string()));
+        }
+
         log::debug!("Content-Type: {} for {}", content_type_str, url);
 
         // 添加详细日志，帮助调试
@@ -294,6 +300,19 @@ impl RssFetcher {
             preview_size,
             &body[..preview_size]
         );
+
+        // 检查响应是否包含有效的XML起始标签
+        let s = String::from_utf8_lossy(&body);
+        let is_valid_xml = s.trim_start().starts_with("<?xml") || s.trim_start().starts_with("<rss") || s.trim_start().starts_with("<feed");
+
+        if !is_valid_xml {
+            log::error!("Response does not contain valid XML content for URL: {}", url);
+            // 尝试将响应转换为字符串，以便记录
+            if let Ok(text) = String::from_utf8(body.to_vec()) {
+                log::error!("Invalid XML content preview: {}", text.chars().take(500).collect::<String>());
+            }
+            return Err(RssError::NetworkError("服务器返回无效的XML内容".to_string()));
+        }
 
         // 检查是否是HTML页面（可能是错误页面或重定向）
         if let Ok(text) = String::from_utf8(body.to_vec()) {

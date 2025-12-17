@@ -121,7 +121,7 @@ impl AppConfig {
 
     /// 创建默认配置
     pub fn default() -> Self {
-        let db_path = "./feeds.db".to_string();
+        let db_path = "./feed.duckdb".to_string();
 
         Self {
             database_path: db_path,
@@ -155,10 +155,24 @@ impl AppConfig {
 
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok()
-                && let Ok(config) = serde_json::from_str(&contents) {
-                    return config;
-                }
+            if file.read_to_string(&mut contents).is_ok() {
+                let config: Self = match serde_json::from_str::<Self>(&contents) {
+                    Ok(mut config) => {
+                        // 检查并更新数据库路径，确保使用正确的文件名
+                        if config.database_path.ends_with("feeds.db") || config.database_path.ends_with("feed.db") {
+                            config.database_path = "./feed.duckdb".to_string();
+                            // 保存更新后的配置
+                            config.save().ok();
+                        }
+                        config
+                    },
+                    Err(_) => {
+                        // 解析失败，返回默认配置
+                        return Self::default();
+                    }
+                };
+                return config;
+            }
         }
 
         // 如果加载失败，返回默认配置

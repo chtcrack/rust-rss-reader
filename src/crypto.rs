@@ -210,20 +210,20 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt() {
         // 创建加密管理器
-        let crypto_manager = CryptoManager::new().unwrap();
+        let crypto_manager = CryptoManager::new().expect("无法创建加密管理器");
         
         // 测试数据
         let test_data = "test_api_key_123456";
         
         // 加密数据
-        let encrypted = crypto_manager.encrypt(test_data).unwrap();
+        let encrypted = crypto_manager.encrypt(test_data).expect("加密数据失败");
         println!("加密后: {}", encrypted);
         
         // 检查是否识别为已加密
         assert!(crypto_manager.is_encrypted(&encrypted));
         
         // 解密数据
-        let decrypted = crypto_manager.decrypt(&encrypted).unwrap();
+        let decrypted = crypto_manager.decrypt(&encrypted).expect("解密数据失败");
         println!("解密后: {}", decrypted);
         
         // 验证解密结果
@@ -233,14 +233,14 @@ mod tests {
     #[test]
     fn test_is_encrypted() {
         // 创建加密管理器
-        let crypto_manager = CryptoManager::new().unwrap();
+        let crypto_manager = CryptoManager::new().expect("无法创建加密管理器");
         
         // 测试明文
         let plaintext = "test_api_key_123456";
         assert!(!crypto_manager.is_encrypted(plaintext));
         
         // 测试加密数据
-        let encrypted = crypto_manager.encrypt(plaintext).unwrap();
+        let encrypted = crypto_manager.encrypt(plaintext).expect("加密数据失败");
         assert!(crypto_manager.is_encrypted(&encrypted));
         
         // 测试无效格式

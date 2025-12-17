@@ -176,7 +176,7 @@ impl CacheManager {
 
         // 过滤掉过期的缓存项
         self.cache_data.retain(|_, entry| {
-            entry.expires_at.is_none() || entry.expires_at.unwrap() >= now
+            entry.expires_at.map_or(true, |expires| expires >= now)
         });
 
         let removed_count = initial_size - self.cache_data.len();

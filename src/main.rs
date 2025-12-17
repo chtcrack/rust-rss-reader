@@ -218,7 +218,7 @@ fn main() -> Result<(), eframe::Error> {
 
 /// 测试自动更新功能
 fn test_auto_update() -> Result<(), eframe::Error> {
-    // 配置日志，设置级别为info以减少调试日志输出
+    // 配置日志，设置级别为info以减少调试日志输出 debug
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // 创建Tokio运行时以支持异步操作
@@ -248,9 +248,9 @@ fn test_auto_update() -> Result<(), eframe::Error> {
 
         // 初始化RSS获取器
         println!("初始化RSS获取器...");
-        let rss_fetcher = Arc::new(Mutex::new(RssFetcher::new(
+        let rss_fetcher = Arc::new(RssFetcher::new(
             "Rust RSS Reader Test/1.0".to_string(),
-        )));
+        ));
 
         // 测试1: 执行自动更新
         println!("\n测试1: 执行自动更新...");
