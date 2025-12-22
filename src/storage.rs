@@ -1795,8 +1795,9 @@ impl StorageManager {
 
         Ok(count)
     }
-
+   
     /// 获取单个文章
+    #[allow(dead_code)]
     pub async fn get_article(&self, article_id: i64) -> anyhow::Result<Article> {
         let conn = self.conn.lock().unwrap_or_else(|_| panic!("无法获取数据库连接锁"));
 

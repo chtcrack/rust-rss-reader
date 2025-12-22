@@ -410,15 +410,20 @@ impl RssFetcher {
         
         // 7. 尝试使用EUC-KR编码（韩文编码）
         log::info!("尝试使用EUC-KR编码解析");
-        let (text, _encoding, _had_errors) = EUC_KR.decode(&body);
+        let (text, encoding, had_errors) = EUC_KR.decode(&body);
+        log::debug!("EUC-KR解码信息: 编码={:?}, 有错误={}", encoding, had_errors);
         let text_bytes = text.as_bytes();
+        log::debug!("解码后文本前100字节: {:?}", &text_bytes[..std::cmp::min(100, text_bytes.len())]);
         match Channel::read_from(text_bytes) {
             Ok(channel) => {
                 log::info!("🎉 EUC-KR解码后解析成功");
+                log::debug!("频道标题: {}", channel.title());
                 return Ok(self.parse_items_to_articles(&channel));
             }
             Err(e) => log::error!("EUC-KR解码后解析失败: {:?}", e),
         }
+
+
 
         // 7. 尝试对文本进行清理和预处理
         log::info!("尝试文本清理和预处理后解析");

@@ -152,7 +152,7 @@ impl AppConfig {
             search_mode: "direct_search".to_string(),
             // 自动清理旧文章配置
             enable_auto_cleanup: false,
-            article_retention_days: 60, // 默认保留30天
+            article_retention_days: 60, // 默认保留60天
             max_articles_per_feed: 1000, // 默认每个订阅源保留1000篇文章
             // AI配置默认值
             ai_api_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),

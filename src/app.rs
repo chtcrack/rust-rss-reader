@@ -3861,6 +3861,12 @@ impl eframe::App for App {
                 if all_response.clicked() {
                     self.selected_feed_id = Some(-1);
                     self.selected_article_id = None;
+                    
+                    // 重置搜索状态
+                    self.search_input.clear();
+                    self.is_search_mode = false;
+                    // 重置当前页码为1
+                    self.current_page = 1;
 
                     // 加载所有文章
                     let storage = self.storage.clone();
@@ -3923,6 +3929,12 @@ impl eframe::App for App {
                         if response.clicked() {
                             self.selected_feed_id = Some(feed.id);
                             self.selected_article_id = None;
+                            
+                            // 重置搜索状态
+                            self.search_input.clear();
+                            self.is_search_mode = false;
+                            // 重置当前页码为1
+                            self.current_page = 1;
 
                             // 加载该订阅源的文章
                             // 克隆必要的参数而不是整个App实例
@@ -4041,6 +4053,12 @@ impl eframe::App for App {
                                 if response.clicked() {
                                     self.selected_feed_id = Some(feed.id);
                                     self.selected_article_id = None;
+                                    
+                                    // 重置搜索状态
+                                    self.search_input.clear();
+                                    self.is_search_mode = false;
+                                    // 重置当前页码为1
+                                    self.current_page = 1;
 
                                     // 加载该订阅源的文章
                                     let storage = self.storage.clone();
@@ -4350,7 +4368,7 @@ impl eframe::App for App {
                         });
                     }
                 
-                if ui.button("全部删除").clicked()
+                if ui.button(egui::RichText::new("全部删除").color(egui::Color32::RED)).clicked()
                     && let Some(feed_id) = self.selected_feed_id {
                         // 克隆必要的参数而不是整个App实例
                         let storage = self.storage.clone();
@@ -4599,7 +4617,7 @@ impl eframe::App for App {
                         }
                     }
                     
-                    if ui.button("批量删除").clicked() {
+                    if ui.button(egui::RichText::new("批量删除").color(egui::Color32::RED)).clicked() {
                         if self.selected_articles.is_empty() {
                             self.status_message = "请先选择要删除的文章".to_string();
                         } else {
@@ -5004,11 +5022,13 @@ impl eframe::App for App {
                                 let ui_tx_outer = self.ui_tx.clone();
                                 let ui_tx_inner = self.ui_tx.clone();
                                 let article_id = article.id;
+                                let feed_id = article.feed_id;
                                 tokio::spawn(async move {
                                     if let Err(e) = delete_article_async(
                                         storage,
                                         search_manager,
                                         article_id,
+                                        feed_id,
                                         ui_tx_inner,
                                     )
                                     .await
@@ -5889,13 +5909,10 @@ async fn delete_article_async(
     storage: Arc<RwLock<StorageManager>>,
     search_manager: Arc<Mutex<SearchManager>>,
     article_id: i64,
+    feed_id: i64,
     ui_tx: Sender<UiMessage>,
 ) -> anyhow::Result<()> {
     let mut storage = storage.write().await;
-
-    // 获取文章信息，以便获取 feed_id
-    let article = storage.get_article(article_id).await?;
-    let feed_id = article.feed_id;
 
     // 删除文章
     storage.delete_article(article_id).await?;
