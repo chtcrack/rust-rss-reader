@@ -201,9 +201,9 @@ impl RssFetcher {
 
                     // 指数退避重试
                     if attempt < max_retries - 1 {
-                        let delay_ms = 200 * (2_u64.pow(attempt as u32));
-                        log::info!("Retrying after {}ms...", delay_ms);
-                        sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        let delay_secs = 2_u64.pow(attempt as u32);
+                        log::info!("Retrying after {}s...", delay_secs);
+                        sleep(tokio::time::Duration::from_secs(delay_secs)).await;
                     }
                 }
             }
@@ -533,8 +533,16 @@ impl RssFetcher {
         
         // 构建浏览器启动选项，使用非无头模式以避免403错误
         // 并添加命令行参数，尽量隐藏浏览器窗口
+        // 动态构建Chrome路径，使用环境变量获取Program Files目录
+        let chrome_path = if let Ok(program_files) = std::env::var("ProgramFiles") {
+            std::path::PathBuf::from(program_files).join(r"Google\Chrome\Application\chrome.exe")
+        } else {
+            // 如果获取环境变量失败，默认使用C盘路径
+            std::path::PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        };
         let launch_options = LaunchOptionsBuilder::default()
             .headless(false) // 禁用无头模式，因为很多网站会阻止无头浏览器
+            .path(Some(chrome_path)) // 设置路径
             .window_size(Some((800, 600)))
             // 添加命令行参数，将窗口定位到屏幕外
             .args(vec![
