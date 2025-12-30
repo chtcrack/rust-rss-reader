@@ -1,5 +1,3 @@
-// 配置管理模块
-
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -43,6 +41,17 @@ pub fn convert_to_configured_timezone(utc_time: &DateTime<Utc>, timezone_str: &s
         let converted = *utc_time + chrono::Duration::hours(8);
         format!("{} (+08:00)", converted.format("%Y-%m-%d %H:%M:%S"))
     }
+}
+
+/// AI配置项
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AIConfig {
+    pub id: String,
+    pub name: String,
+    pub api_url: String,
+    pub api_key: String,
+    pub api_key_encrypted: bool,
+    pub model_name: String,
 }
 
 /// 应用程序配置
@@ -97,22 +106,25 @@ pub struct AppConfig {
     /// 每个订阅源保留的最大文章数，超过此数量的旧文章将被自动清理
     pub max_articles_per_feed: u32,
 
-    /// AI API URL地址
+    /// AI配置列表
+    pub ai_configs: Vec<AIConfig>,
+    /// 当前使用的AI配置ID
+    pub current_ai_config_id: String,
+
+    /// 以下字段用于兼容旧版本配置，将在加载时转换为AIConfig
+    #[serde(skip_serializing, default = "Default::default")]
     pub ai_api_url: String,
-
-    /// AI API Key（加密存储）
+    #[serde(skip_serializing, default = "Default::default")]
     pub ai_api_key: String,
-
-    /// 标记AI API Key是否已加密
+    #[serde(skip_serializing, default = "Default::default")]
     pub ai_api_key_encrypted: bool,
-
-    /// AI 模型名称
+    #[serde(skip_serializing, default = "Default::default")]
     pub ai_model_name: String,
 }
 
 impl AppConfig {
     /// 获取配置文件路径
-    fn config_path() -> PathBuf {
+    pub fn config_path() -> PathBuf {
         let mut path = if cfg!(target_os = "windows") {
             dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."))
         } else {
@@ -127,10 +139,20 @@ impl AppConfig {
         path.push("config.json");
         path
     }
-
+    
     /// 创建默认配置
     pub fn default() -> Self {
         let db_path = "./feed.duckdb".to_string();
+        
+        // 创建默认AI配置
+        let default_ai_config = AIConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "SiliconFlow".to_string(),
+            api_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
+            api_key: "".to_string(),
+            api_key_encrypted: false,
+            model_name: "Qwen/Qwen3-8B".to_string(),
+        };
 
         Self {
             database_path: db_path,
@@ -155,13 +177,16 @@ impl AppConfig {
             article_retention_days: 60, // 默认保留60天
             max_articles_per_feed: 1000, // 默认每个订阅源保留1000篇文章
             // AI配置默认值
-            ai_api_url: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
+            ai_configs: vec![default_ai_config.clone()],
+            current_ai_config_id: default_ai_config.id,
+            // 兼容旧版本配置的字段
+            ai_api_url: "".to_string(),
             ai_api_key: "".to_string(),
             ai_api_key_encrypted: false,
-            ai_model_name: "Qwen/Qwen3-8B".to_string(),
+            ai_model_name: "".to_string(),
         }
     }
-
+    
     /// 加载配置或使用默认值
     pub fn load_or_default() -> Self {
         let path = Self::config_path();
@@ -169,7 +194,7 @@ impl AppConfig {
         if let Ok(mut file) = File::open(path) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
-                let config: Self = match serde_json::from_str::<Self>(&contents) {
+                let mut config: Self = match serde_json::from_str::<Self>(&contents) {
                     Ok(mut config) => {
                         // 检查并更新数据库路径，确保使用正确的文件名
                         if config.database_path.ends_with("feeds.db") || config.database_path.ends_with("feed.db") {
@@ -179,114 +204,326 @@ impl AppConfig {
                         }
                         config
                     },
-                    Err(_) => {
-                        // 解析失败，返回默认配置
-                        return Self::default();
+                    Err(e) => {
+                        // 解析失败，记录错误日志
+                        log::error!("配置文件解析失败: {}", e);
+                        // 解析失败，尝试兼容旧版本配置
+                        return Self::load_legacy_config(&contents);
                     }
                 };
+                
+                // 处理旧版本配置转换（如果需要）
+                config = config.migrate_legacy_config();
+                // 保存迁移后的配置
+                config.save().ok();
                 return config;
             }
         }
-
-        // 如果加载失败，返回默认配置
         Self::default()
     }
-
+    
+    /// 加载旧版本配置
+    fn load_legacy_config(contents: &str) -> Self {
+        // 定义旧版本配置结构
+        #[derive(Deserialize)]
+        struct LegacyConfig {
+            database_path: Option<String>,
+            theme: Option<String>,
+            auto_refresh_interval: Option<u32>,
+            user_agent: Option<String>,
+            font_size: Option<f32>,
+            window_width: Option<u32>,
+            window_height: Option<u32>,
+            show_tray_icon: Option<bool>,
+            enable_notifications: Option<bool>,
+            max_notifications: Option<usize>,
+            notification_timeout_ms: Option<u64>,
+            timezone: Option<String>,
+            show_console: Option<bool>,
+            search_mode: Option<String>,
+            enable_auto_cleanup: Option<bool>,
+            article_retention_days: Option<u32>,
+            max_articles_per_feed: Option<u32>,
+            ai_api_url: Option<String>,
+            ai_api_key: Option<String>,
+            ai_model_name: Option<String>,
+        }
+        
+        let default = Self::default();
+        
+        match serde_json::from_str::<LegacyConfig>(contents) {
+            Ok(legacy) => {
+                // 创建默认配置
+                let mut config = Self::default();
+                
+                // 更新从旧配置读取的值
+                if let Some(db_path) = legacy.database_path {
+                    config.database_path = db_path;
+                }
+                if let Some(theme) = legacy.theme {
+                    config.theme = theme;
+                }
+                if let Some(interval) = legacy.auto_refresh_interval {
+                    config.auto_refresh_interval = interval;
+                }
+                if let Some(ua) = legacy.user_agent {
+                    config.user_agent = ua;
+                }
+                if let Some(font) = legacy.font_size {
+                    config.font_size = font;
+                }
+                if let Some(width) = legacy.window_width {
+                    config.window_width = width;
+                }
+                if let Some(height) = legacy.window_height {
+                    config.window_height = height;
+                }
+                if let Some(tray) = legacy.show_tray_icon {
+                    config.show_tray_icon = tray;
+                }
+                if let Some(notify) = legacy.enable_notifications {
+                    config.enable_notifications = notify;
+                }
+                if let Some(max) = legacy.max_notifications {
+                    config.max_notifications = max;
+                }
+                if let Some(timeout) = legacy.notification_timeout_ms {
+                    config.notification_timeout_ms = timeout;
+                }
+                if let Some(tz) = legacy.timezone {
+                    config.timezone = tz;
+                }
+                if let Some(console) = legacy.show_console {
+                    config.show_console = console;
+                }
+                if let Some(mode) = legacy.search_mode {
+                    config.search_mode = mode;
+                }
+                if let Some(cleanup) = legacy.enable_auto_cleanup {
+                    config.enable_auto_cleanup = cleanup;
+                }
+                if let Some(days) = legacy.article_retention_days {
+                    config.article_retention_days = days;
+                }
+                if let Some(max) = legacy.max_articles_per_feed {
+                    config.max_articles_per_feed = max;
+                }
+                
+                // 添加旧版本AI配置
+                if let (Some(api_url), Some(api_key), Some(model_name)) = (
+                    legacy.ai_api_url,
+                    legacy.ai_api_key,
+                    legacy.ai_model_name
+                ) {
+                    config.add_ai_config(
+                        "Legacy Config",
+                        &api_url,
+                        &api_key,
+                        &model_name
+                    );
+                }
+                
+                config
+            }
+            Err(e) => {
+                // 解析失败，记录错误日志
+                log::error!("旧版本配置解析失败: {}", e);
+                // 解析失败，返回默认配置
+                default
+            }
+        }
+    }
+    
+    /// 迁移旧版本配置
+    fn migrate_legacy_config(mut self) -> Self {
+        // 检查是否需要迁移
+        if self.ai_configs.is_empty() {
+            // 创建默认AI配置
+            let default_config = AIConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "Default Config".to_string(),
+                api_url: self.ai_api_url.clone(),
+                api_key: self.ai_api_key.clone(),
+                api_key_encrypted: self.ai_api_key_encrypted,
+                model_name: self.ai_model_name.clone(),
+            };
+            
+            self.ai_configs.push(default_config.clone());
+            self.current_ai_config_id = default_config.id;
+        } else {
+            // 检查current_ai_config_id是否指向有效的配置
+            if !self.ai_configs.iter().any(|config| config.id == self.current_ai_config_id) {
+                // 如果无效，更新为第一个配置的ID
+                if let Some(first_config) = self.ai_configs.first() {
+                    self.current_ai_config_id = first_config.id.clone();
+                }
+            }
+        }
+        self
+    }
+    
+    /// 获取当前AI配置
+    pub fn get_current_ai_config(&self) -> Option<&AIConfig> {
+        self.ai_configs.iter().find(|config| config.id == self.current_ai_config_id)
+    }
+    
+    /// 获取当前AI配置的解密API密钥
+    pub fn get_current_decrypted_api_key(&self) -> Result<String, CryptoError> {
+        if let Some(current_config) = self.get_current_ai_config() {
+            if current_config.api_key.is_empty() {
+                return Ok("".to_string());
+            }
+            
+            // 创建加密管理器
+            let crypto_manager = CryptoManager::new()?;
+            
+            // 检查API密钥是否已加密，即使标记为未加密，也检查格式
+            let is_encrypted = current_config.api_key_encrypted || crypto_manager.is_encrypted(&current_config.api_key);
+            
+            if !is_encrypted {
+                return Ok(current_config.api_key.clone());
+            }
+            
+            return crypto_manager.decrypt(&current_config.api_key);
+        }
+        Ok("".to_string())
+    }
+    
+    /// 添加AI配置
+    pub fn add_ai_config(&mut self, name: &str, api_url: &str, api_key: &str, model_name: &str) {
+        let new_config = AIConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            api_url: api_url.to_string(),
+            api_key: api_key.to_string(),
+            api_key_encrypted: false,
+            model_name: model_name.to_string(),
+        };
+        
+        self.ai_configs.push(new_config.clone());
+        // 如果是第一个配置，设置为当前配置
+        if self.ai_configs.len() == 1 {
+            self.current_ai_config_id = new_config.id;
+        }
+    }
+    
     /// 保存配置到文件
-    pub fn save(&self) -> Result<(), std::io::Error> {
+    pub fn save(&mut self) -> Result<(), std::io::Error> {
         let path = Self::config_path();
         
         // 创建一个临时配置，用于保存到文件
-        // 如果API密钥未加密，加密后再保存
         let mut config_to_save = self.clone();
         
-        // 只在API密钥不为空且未加密的情况下进行加密
-        if !config_to_save.ai_api_key.is_empty() && !config_to_save.ai_api_key_encrypted {
-            match CryptoManager::new() {
-                Ok(crypto_manager) => {
-                    match crypto_manager.encrypt(&config_to_save.ai_api_key) {
-                    Ok(encrypted_key) => {
-                        config_to_save.ai_api_key = encrypted_key;
-                        config_to_save.ai_api_key_encrypted = true;
+        // 加密所有API密钥
+        for ai_config in &mut config_to_save.ai_configs {
+            if !ai_config.api_key.is_empty() {
+                // 创建加密管理器
+                match CryptoManager::new() {
+                    Ok(crypto_manager) => {
+                        // 检查API密钥是否已加密，即使标记为未加密，也检查格式
+                        let is_encrypted = ai_config.api_key_encrypted || crypto_manager.is_encrypted(&ai_config.api_key);
+                        
+                        if !is_encrypted {
+                            // 加密API密钥
+                            match crypto_manager.encrypt(&ai_config.api_key) {
+                                Ok(encrypted_key) => {
+                                    ai_config.api_key = encrypted_key;
+                                    ai_config.api_key_encrypted = true;
+                                },
+                                Err(e) => {
+                                    log::error!("保存配置时加密API密钥失败: {:?}", e);
+                                    // 加密失败，继续保存，但标记为未加密
+                                    ai_config.api_key_encrypted = false;
+                                },
+                            }
+                        }
                     },
                     Err(e) => {
-                        log::error!("保存配置时加密API密钥失败: {:?}", e);
-                        // 加密失败，继续保存，但标记为未加密
-                        config_to_save.ai_api_key_encrypted = false;
+                        log::error!("创建加密管理器失败: {:?}", e);
+                        // 创建加密管理器失败，继续保存，但标记为未加密
+                        ai_config.api_key_encrypted = false;
                     },
                 }
-                },
-                Err(e) => {
-                    log::error!("创建加密管理器失败: {:?}", e);
-                    // 创建加密管理器失败，继续保存，但标记为未加密
-                    config_to_save.ai_api_key_encrypted = false;
-                },
             }
         }
-
+        
         let json = serde_json::to_string_pretty(&config_to_save)?;
         let mut file = File::create(path)?;
         file.write_all(json.as_bytes())?;
-
-        Ok(())
-    }
-    
-    /// 获取解密后的API密钥
-    pub fn get_decrypted_api_key(&self) -> Result<String, CryptoError> {
-        if self.ai_api_key.is_empty() {
-            return Ok("".to_string());
-        }
-        
-        // 创建加密管理器
-        let crypto_manager = CryptoManager::new()?;
-        
-        // 检查API密钥是否已加密，即使标记为未加密，也检查格式
-        let is_encrypted = self.ai_api_key_encrypted || crypto_manager.is_encrypted(&self.ai_api_key);
-        
-        if !is_encrypted {
-            return Ok(self.ai_api_key.clone());
-        }
-        
-        crypto_manager.decrypt(&self.ai_api_key)
-    }
-    
-    /// 设置API密钥（自动处理加密）
-    #[allow(dead_code)]
-    pub fn set_api_key(&mut self, api_key: &str) {
-        // 清除加密标记，因为我们设置的是明文
-        self.ai_api_key = api_key.to_string();
-        self.ai_api_key_encrypted = false;
-    }
-    
-    /// 加密API密钥（如果未加密）
-    #[allow(dead_code)]
-    pub fn encrypt_api_key(&mut self) -> Result<(), CryptoError> {
-        if self.ai_api_key.is_empty() || self.ai_api_key_encrypted {
-            return Ok(());
-        }
-        
-        let crypto_manager = CryptoManager::new()?;
-        let encrypted_key = crypto_manager.encrypt(&self.ai_api_key)?;
-        
-        self.ai_api_key = encrypted_key;
-        self.ai_api_key_encrypted = true;
         
         Ok(())
     }
     
-    /// 解密API密钥（如果已加密）
-    #[allow(dead_code)]
-    pub fn decrypt_api_key(&mut self) -> Result<(), CryptoError> {
-        if self.ai_api_key.is_empty() || !self.ai_api_key_encrypted {
-            return Ok(());
+    /// 切换AI配置
+    pub fn switch_ai_config(&mut self, config_id: &str) -> bool {
+        if self.ai_configs.iter().any(|config| config.id == config_id) {
+            self.current_ai_config_id = config_id.to_string();
+            return true;
+        }
+        false
+    }
+    
+    /// 编辑AI配置
+    pub fn edit_ai_config(&mut self, config_id: &str, name: &str, api_url: &str, api_key: &str, model_name: &str) -> bool {
+        if let Some(config) = self.ai_configs.iter_mut().find(|c| c.id == config_id) {
+            config.name = name.to_string();
+            config.api_url = api_url.to_string();
+            config.api_key = api_key.to_string();
+            // 用户输入的API密钥是明文的，所以将api_key_encrypted设置为false
+            config.api_key_encrypted = false;
+            config.model_name = model_name.to_string();
+            return true;
+        }
+        false
+    }
+    
+    /// 删除AI配置
+    pub fn delete_ai_config(&mut self, config_id: &str) -> bool {
+        let initial_len = self.ai_configs.len();
+        self.ai_configs.retain(|config| config.id != config_id);
+        let deleted = self.ai_configs.len() != initial_len;
+        
+        // 如果删除的是当前使用的配置，更新current_ai_config_id为第一个配置的ID
+        if deleted && self.current_ai_config_id == config_id
+            && let Some(first_config) = self.ai_configs.first() {
+            self.current_ai_config_id = first_config.id.clone();
         }
         
-        let crypto_manager = CryptoManager::new()?;
-        let decrypted_key = crypto_manager.decrypt(&self.ai_api_key)?;
-        
-        self.ai_api_key = decrypted_key;
-        self.ai_api_key_encrypted = false;
-        
+        deleted
+    }
+    
+    /// 获取AI配置列表
+    #[allow(unused)]
+    pub fn get_ai_configs(&self) -> &Vec<AIConfig> {
+        &self.ai_configs
+    }
+    
+    /// 导出AI配置为JSON字符串
+    pub fn export_ai_configs(&self) -> Result<String, serde_json::Error> {
+        // 导出时加密所有API密钥
+        let mut export_configs = self.ai_configs.clone();
+        for config in &mut export_configs {
+            if !config.api_key.is_empty() && !config.api_key_encrypted {
+                match CryptoManager::new() {
+                    Ok(crypto_manager) => {
+                        if let Ok(encrypted_key) = crypto_manager.encrypt(&config.api_key) {
+                            config.api_key = encrypted_key;
+                            config.api_key_encrypted = true;
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("创建加密管理器失败: {:?}", e);
+                    },
+                }
+            }
+        }
+        serde_json::to_string_pretty(&export_configs)
+    }
+    
+    /// 导入AI配置
+    pub fn import_ai_configs(&mut self, json_str: &str) -> Result<(), serde_json::Error> {
+        let imported_configs: Vec<AIConfig> = serde_json::from_str(json_str)?;
+        self.ai_configs.extend(imported_configs);
         Ok(())
     }
 }

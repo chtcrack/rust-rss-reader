@@ -13,7 +13,7 @@ use url::Url;
 
 
 // 导入自定义模块
-use crate::ai_client::{AIChatSession, AIClient};
+use crate::ai_client::{AIChatSession, AIClient, AIClientError};
 use crate::article_processor;
 use crate::config::{AppConfig, convert_to_configured_timezone, APP_WINDOW_TITLE};
 use crate::feed_manager::FeedManager;
@@ -450,12 +450,16 @@ async fn add_feed_async(
             
             // 获取AI客户端
             let config = crate::config::AppConfig::load_or_default();
-            let decrypted_api_key = config.get_decrypted_api_key().unwrap_or_default();
-            let ai_client = AIClient::new(
-                &config.ai_api_url,
-                &decrypted_api_key,
-                &config.ai_model_name,
-            );
+            let ai_client = if let Some(current_ai_config) = config.get_current_ai_config() {
+                let decrypted_api_key = config.get_current_decrypted_api_key().unwrap_or_default();
+                AIClient::new(
+                    &current_ai_config.api_url,
+                    &decrypted_api_key,
+                    &current_ai_config.model_name,
+                )
+            } else {
+                Err(AIClientError::ConfigError("No AI config available".to_string()))
+            };
             
             if let Ok(ai_client) = ai_client {
                 // 使用独立线程执行翻译，避免阻塞主线程
@@ -466,7 +470,7 @@ async fn add_feed_async(
                     
                     for article in articles {
                         // 检测文章标题语言
-                        let lang_result = ai_client.detect_language(&article.title).await;
+                        let lang_result: Result<String, AIClientError> = ai_client.detect_language(&article.title).await;
                         
                         match lang_result {
                             Ok(lang) => {
@@ -929,6 +933,7 @@ pub struct App {
     ai_chat_input: String,
 
     // AI设置窗口输入状态
+    ai_settings_name: String,
     ai_settings_api_url: String,
     ai_settings_api_key: String,
     ai_settings_model_name: String,
@@ -1121,14 +1126,18 @@ impl App {
             show_ai_settings_dialog: false,
             ai_chat_messages: Vec::new(),
             ai_client: {
-                // 获取解密后的API密钥
-                let decrypted_api_key = config.get_decrypted_api_key().unwrap_or_default();
-                AIClient::new(
-                    &config.ai_api_url,
-                    &decrypted_api_key,
-                    &config.ai_model_name,
-                )
-                .ok()
+                // 获取当前AI配置和解密后的API密钥
+                if let Some(current_ai_config) = config.get_current_ai_config() {
+                    let decrypted_api_key = config.get_current_decrypted_api_key().unwrap_or_default();
+                    AIClient::new(
+                        &current_ai_config.api_url,
+                        &decrypted_api_key,
+                        &current_ai_config.model_name,
+                    )
+                    .ok()
+                } else {
+                    None
+                }
             },
             ai_chat_session: None,
 
@@ -1141,9 +1150,10 @@ impl App {
             ai_chat_input: String::new(),
 
             // AI设置窗口输入状态
-            ai_settings_api_url: config.ai_api_url.clone(),
-            ai_settings_api_key: config.get_decrypted_api_key().unwrap_or_default(),
-            ai_settings_model_name: config.ai_model_name.clone(),
+            ai_settings_name: config.get_current_ai_config().map(|c| c.name.clone()).unwrap_or_default(),
+            ai_settings_api_url: config.get_current_ai_config().map(|c| c.api_url.clone()).unwrap_or_default(),
+            ai_settings_api_key: config.get_current_decrypted_api_key().unwrap_or_default(),
+            ai_settings_model_name: config.get_current_ai_config().map(|c| c.model_name.clone()).unwrap_or_default(),
 
             // 网页内容加载状态
             is_loading_web_content: false,
@@ -3769,10 +3779,12 @@ impl eframe::App for App {
                     ui.separator();
                     if ui.button("AI设置").clicked() {
                         // 将当前配置的值复制到AI设置窗口的输入字段
-                        self.ai_settings_api_url = self.config.ai_api_url.clone();
-                        // 获取解密后的API密钥，以便用户在设置窗口中查看和编辑
-                        self.ai_settings_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
-                        self.ai_settings_model_name = self.config.ai_model_name.clone();
+                        if let Some(current_config) = self.config.get_current_ai_config() {
+                            self.ai_settings_name = current_config.name.clone();
+                            self.ai_settings_api_url = current_config.api_url.clone();
+                            self.ai_settings_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                            self.ai_settings_model_name = current_config.model_name.clone();
+                        }
                         
                         self.show_ai_settings_dialog = true;
                     }
@@ -5458,80 +5470,259 @@ impl eframe::App for App {
             // 创建临时变量来存储输入值
             egui::Window::new("AI设置")
                 .resizable(true)
-                .default_width(500.0)
+                .default_width(700.0)
+                .default_height(500.0)
                 .show(ctx, |ui| {
-                    ui.label("API URL:");
-                    ui.text_edit_singleline(&mut self.ai_settings_api_url);
-
-                    ui.label("API Key:");
-                    ui.text_edit_singleline(&mut self.ai_settings_api_key);
-
-                    ui.label("模型名称:");
-                    ui.text_edit_singleline(&mut self.ai_settings_model_name);
-
-                    ui.separator();
-
-                    ui.horizontal(|ui| {
-                        if ui.button("保存").clicked() {
-                            // 获取当前解密后的API密钥
-                            let current_decrypted_key = self.config.get_decrypted_api_key().unwrap_or_default();
+                    // 配置列表和编辑区域使用水平布局
+                    ui.columns(2, |columns| {
+                        // 左侧：配置列表
+                        let list_panel = &mut columns[0];
+                        list_panel.set_min_width(200.0);
+                        
+                        list_panel.label("AI配置列表");
+                        list_panel.separator();
+                        
+                        // 显示所有配置项
+                        // 先克隆配置列表，避免在循环中同时借用不可变和可变引用
+                        let ai_configs = self.config.ai_configs.clone();
+                        let current_config_id = self.config.current_ai_config_id.clone();
+                        
+                        for ai_config in ai_configs {
+                            let is_current = ai_config.id == current_config_id;
                             
-                            // 比较输入的API密钥与当前解密后的密钥
-                            if self.ai_settings_api_key != current_decrypted_key {
-                                // API密钥发生了变化，更新并加密
-                                self.config.ai_api_url = self.ai_settings_api_url.clone();
-                                // 直接设置API密钥并标记为未加密，这样save()方法会自动加密
-                                self.config.ai_api_key = self.ai_settings_api_key.clone();
-                                self.config.ai_api_key_encrypted = false;
-                                self.config.ai_model_name = self.ai_settings_model_name.clone();
-                                
-                                // 保存配置到文件
-                                if let Err(e) = self.config.save() {
-                                    log::error!("保存AI设置失败: {}", e);
-                                    self.status_message = format!("保存AI设置失败: {}", e);
+                            list_panel.horizontal(|ui| {
+                                // 高亮当前配置
+                                if is_current {
+                                    ui.strong(format!("● {}", ai_config.name));
                                 } else {
-                                    // 重新初始化AI客户端，使用解密后的API密钥
-                                    let decrypted_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
-                                    self.ai_client = AIClient::new(
-                                        &self.ai_settings_api_url,
-                                        &decrypted_api_key,
-                                        &self.ai_settings_model_name,
-                                    )
-                                    .ok();
-                                    self.status_message = "AI设置已保存".to_string();
+                                    ui.label(format!("○ {}", ai_config.name));
                                 }
+                                
+                                // 切换配置按钮
+                                if ui.button("切换").clicked() {
+                                    // 切换配置
+                                    self.config.switch_ai_config(&ai_config.id);
+                                    
+                                    // 保存配置到文件
+                                    if let Err(e) = self.config.save() {
+                                        log::error!("保存AI配置切换失败: {}", e);
+                                        self.status_message = format!("保存AI配置切换失败: {}", e);
+                                    }
+                                    
+                                    // 重新初始化AI客户端
+                                    let decrypted_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                    self.ai_client = AIClient::new(
+                                        &ai_config.api_url,
+                                        &decrypted_api_key,
+                                        &ai_config.model_name,
+                                    )
+                                    .ok();
+                                    
+                                    // 更新AI聊天会话
+                                    if let Some(new_client) = &self.ai_client {
+                                        self.ai_chat_session = Some(AIChatSession::new(new_client.clone()));
+                                    }
+                                    
+                                    // 更新输入框内容
+                                    self.ai_settings_api_url = ai_config.api_url.clone();
+                                    self.ai_settings_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                    self.ai_settings_model_name = ai_config.model_name.clone();
+                                    self.ai_settings_name = ai_config.name.clone();
+                                }
+                            });
+                        }
+                        
+                        list_panel.separator();
+                        
+                        // 导入导出按钮
+                        if list_panel.button("导出配置").clicked()
+                            && let Ok(json_str) = self.config.export_ai_configs() {
+                            // 使用rfd保存文件
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name("ai_configs.json")
+                                .save_file() {
+                                if let Err(e) = std::fs::write(path, json_str) {
+                                    log::error!("导出配置失败: {}", e);
+                                    self.status_message = format!("导出配置失败: {}", e);
+                                } else {
+                                    self.status_message = "配置导出成功".to_string();
+                                }
+                            }
+                        }
+                        
+                        if list_panel.button("导入配置").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_title("导入AI配置")
+                                .add_filter("JSON", &["json"])
+                                .pick_file()
+                            && let Ok(json_str) = std::fs::read_to_string(path) {
+                            if let Err(e) = self.config.import_ai_configs(&json_str) {
+                                log::error!("导入配置失败: {}", e);
+                                self.status_message = format!("导入配置失败: {}", e);
                             } else {
-                                // API密钥没有变化，只更新URL和模型名称
-                                self.config.ai_api_url = self.ai_settings_api_url.clone();
-                                self.config.ai_model_name = self.ai_settings_model_name.clone();
+                                self.status_message = "配置导入成功".to_string();
+                                // 保存配置
+                                self.config.save().ok();
+                            }
+                        }
+                        
+                        // 右侧：配置编辑区域
+                        let edit_panel = &mut columns[1];
+                        
+                        edit_panel.label("配置详情");
+                        edit_panel.separator();
+                        
+                        edit_panel.label("平台名称:");
+                        edit_panel.text_edit_singleline(&mut self.ai_settings_name);
+                        
+                        edit_panel.label("API URL:");
+                        edit_panel.text_edit_singleline(&mut self.ai_settings_api_url);
+
+                        edit_panel.label("API Key:");
+                        edit_panel.text_edit_singleline(&mut self.ai_settings_api_key);
+
+                        edit_panel.label("模型名称:");
+                        edit_panel.text_edit_singleline(&mut self.ai_settings_model_name);
+
+                        edit_panel.separator();
+
+                        edit_panel.horizontal(|ui| {
+                            // 保存当前配置按钮
+                            if ui.button("保存当前配置").clicked() {
+                                // 先获取当前配置ID，避免可变借用冲突
+                                let current_config_id = self.config.current_ai_config_id.clone();
+                                
+                                // 更新当前配置
+                                self.config.edit_ai_config(
+                                    &current_config_id,
+                                    &self.ai_settings_name,
+                                    &self.ai_settings_api_url,
+                                    &self.ai_settings_api_key,
+                                    &self.ai_settings_model_name,
+                                );
                                 
                                 // 保存配置到文件
                                 if let Err(e) = self.config.save() {
                                     log::error!("保存AI设置失败: {}", e);
                                     self.status_message = format!("保存AI设置失败: {}", e);
                                 } else {
-                                    // 重新初始化AI客户端，使用解密后的API密钥
-                                    let decrypted_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
-                                    self.ai_client = AIClient::new(
-                                        &self.ai_settings_api_url,
-                                        &decrypted_api_key,
-                                        &self.ai_settings_model_name,
-                                    )
-                                    .ok();
+                                    // 重新初始化AI客户端
+                                    let decrypted_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                    let current_config = self.config.get_current_ai_config();
+                                    if let Some(config) = current_config {
+                                        self.ai_client = AIClient::new(
+                                            &config.api_url,
+                                            &decrypted_api_key,
+                                            &config.model_name,
+                                        )
+                                        .ok();
+                                    } else {
+                                        // 如果获取当前配置失败，使用保存的配置值
+                                        self.ai_client = AIClient::new(
+                                            &self.ai_settings_api_url,
+                                            &decrypted_api_key,
+                                            &self.ai_settings_model_name,
+                                        )
+                                        .ok();
+                                    }
+                                    
+                                    // 更新AI聊天会话
+                                    if let Some(new_client) = &self.ai_client {
+                                        self.ai_chat_session = Some(AIChatSession::new(new_client.clone()));
+                                    }
                                     self.status_message = "AI设置已保存".to_string();
                                 }
                             }
-
-                            self.show_ai_settings_dialog = false;
-                        }
-
-                        if ui.button("取消").clicked() {
-                            // 取消时，恢复原有配置到输入框，显示解密后的API密钥
-                            self.ai_settings_api_url = self.config.ai_api_url.clone();
-                            self.ai_settings_api_key = self.config.get_decrypted_api_key().unwrap_or_default();
-                            self.ai_settings_model_name = self.config.ai_model_name.clone();
-                            self.show_ai_settings_dialog = false;
-                        }
+                            
+                            // 添加新配置按钮
+                            if ui.button("添加新配置").clicked() {
+                                self.config.add_ai_config(
+                                    &self.ai_settings_name,
+                                    &self.ai_settings_api_url,
+                                    &self.ai_settings_api_key,
+                                    &self.ai_settings_model_name,
+                                );
+                                
+                                // 保存配置到文件
+                                if let Err(e) = self.config.save() {
+                                    log::error!("添加AI配置失败: {}", e);
+                                    self.status_message = format!("添加AI配置失败: {}", e);
+                                } else {
+                                    // 重新初始化AI客户端使用新添加的配置
+                                    let last_config = self.config.ai_configs.last().unwrap();
+                                    let decrypted_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                    self.ai_client = AIClient::new(
+                                        &last_config.api_url,
+                                        &decrypted_api_key,
+                                        &last_config.model_name,
+                                    )
+                                    .ok();
+                                    
+                                    // 更新AI聊天会话
+                                    if let Some(new_client) = &self.ai_client {
+                                        self.ai_chat_session = Some(AIChatSession::new(new_client.clone()));
+                                    }
+                                    self.status_message = "AI配置已添加".to_string();
+                                }
+                            }
+                        });
+                        
+                        edit_panel.horizontal(|ui| {
+                            // 删除当前配置按钮
+                            if ui.button("删除当前配置").clicked() {
+                                if self.config.ai_configs.len() > 1 {
+                                    // 先获取当前配置ID，避免可变借用冲突
+                                    let current_config_id = self.config.current_ai_config_id.clone();
+                                    
+                                    if self.config.delete_ai_config(&current_config_id) {
+                                        // 保存配置到文件
+                                        if let Err(e) = self.config.save() {
+                                            log::error!("删除AI配置失败: {}", e);
+                                            self.status_message = format!("删除AI配置失败: {}", e);
+                                        } else {
+                                            // 获取新的当前配置
+                                            if let Some(current_config) = self.config.get_current_ai_config() {
+                                                // 重新初始化AI客户端
+                                                let decrypted_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                                self.ai_client = AIClient::new(
+                                                    &current_config.api_url,
+                                                    &decrypted_api_key,
+                                                    &current_config.model_name,
+                                                )
+                                                .ok();
+                                                
+                                                // 更新AI聊天会话
+                                                if let Some(new_client) = &self.ai_client {
+                                                    self.ai_chat_session = Some(AIChatSession::new(new_client.clone()));
+                                                }
+                                                
+                                                // 更新输入框内容
+                                                self.ai_settings_name = current_config.name.clone();
+                                                self.ai_settings_api_url = current_config.api_url.clone();
+                                                self.ai_settings_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                                self.ai_settings_model_name = current_config.model_name.clone();
+                                            }
+                                            self.status_message = "AI配置已删除".to_string();
+                                        }
+                                    } else {
+                                        self.status_message = "删除AI配置失败: 无法删除当前配置".to_string();
+                                    }
+                                } else {
+                                    self.status_message = "至少需要保留一个AI配置".to_string();
+                                }
+                            }
+                            
+                            if ui.button("取消").clicked() {
+                                // 取消时，恢复原有配置到输入框
+                                if let Some(current_config) = self.config.get_current_ai_config() {
+                                    self.ai_settings_name = current_config.name.clone();
+                                    self.ai_settings_api_url = current_config.api_url.clone();
+                                    self.ai_settings_api_key = self.config.get_current_decrypted_api_key().unwrap_or_default();
+                                    self.ai_settings_model_name = current_config.model_name.clone();
+                                }
+                                self.show_ai_settings_dialog = false;
+                            }
+                        });
                     });
                 });
         }

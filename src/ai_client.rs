@@ -467,7 +467,8 @@ impl AIChatSession {
 
         // 估算发送的总token数
         let total_tokens = self.estimate_messages_tokens(&self.messages);
-        log::info!("发送消息到AI平台，总token数: {}", total_tokens);
+        log::info!("发送消息到AI平台，URL: {}, 模型: {}, 总token数: {}", 
+                   self.client.api_url, self.client.model_name, total_tokens);
 
         // 发送请求
         let response = match self
