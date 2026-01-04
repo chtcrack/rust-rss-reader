@@ -3,6 +3,9 @@
 一个轻量级、高性能的RSS阅读器，具有现代化的用户界面和流畅的用户体验。
 我没学过RUST,此项目完全由AI完成!
 
+另外一个采用Tauri框架写的rss阅读器，界面比较漂亮,可显示图片。
+源码地址:https://github.com/chtcrack/Rss_Reader_Tauri
+
 ## 版本信息
 
 当前版本: 1.3.2
